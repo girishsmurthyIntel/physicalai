@@ -74,6 +74,7 @@ class RerunCallback:
         self._blueprint_updated = False
         self._camera_names: list[str] | None = None
         self._latencies: deque[float] = deque(maxlen=200)
+        self._server_latencies: deque[float] = deque(maxlen=200)
 
     def on_lifecycle(self, event: LifecycleEvent) -> None:  # noqa: D102
         if event.event == "start" and not self._initialized:
@@ -162,6 +163,13 @@ class RerunCallback:
         rr.set_time("step", sequence=self._last_step)
         rr.set_time("wall", timestamp=event.timestamp)
         rr.log("queue/inference", rr.Scalars(float(horizon)))
+        rr.log("inference/latency_ms", rr.Scalars(event.latency_s * 1000.0))
+
+        if event.server_latency_s is not None:
+            self._server_latencies.append(event.server_latency_s)
+            rr.log("inference/server_latency_ms", rr.Scalars(event.server_latency_s * 1000.0))
+            network_ms = max(0.0, (event.latency_s - event.server_latency_s) * 1000.0)
+            rr.log("inference/network_latency_ms", rr.Scalars(network_ms))
 
         # Inference latency stats as a live-updating table.
         self._latencies.append(event.latency_s)
@@ -348,16 +356,32 @@ class RerunCallback:
         queue_time = self._pred_horizon / self._fps if self._pred_horizon else 0
         headroom = queue_time - p99
 
-        md = (
-            f"| Metric | Value |\n"
-            f"|--------|-------|\n"
-            f"| **Last** | {last * 1000:.1f} ms |\n"
-            f"| **p50** | {p50 * 1000:.1f} ms |\n"
-            f"| **p95** | {p95 * 1000:.1f} ms |\n"
-            f"| **p99** | {p99 * 1000:.1f} ms |\n"
-            f"| **Queue headroom** | {headroom * 1000:.0f} ms |\n"
-            f"| Samples | {n} |"
-        )
+        lines = [
+            "| Metric | Value |",
+            "|---|---|",
+            f"| **Last (round-trip)** | {last * 1000:.1f} ms |",
+            f"| **p50** | {p50 * 1000:.1f} ms |",
+            f"| **p95** | {p95 * 1000:.1f} ms |",
+            f"| **p99** | {p99 * 1000:.1f} ms |",
+        ]
+
+        if self._server_latencies:
+            server_arr = np.array(self._server_latencies)
+            s_last = float(server_arr[-1])
+            s_p50 = float(np.percentile(server_arr, 50))
+            net_last = max(0.0, (last - s_last) * 1000.0)
+            lines.extend([
+                f"| **Server Compute (last)** | {s_last * 1000:.1f} ms |",
+                f"| **Server Compute (p50)** | {s_p50 * 1000:.1f} ms |",
+                f"| **Network Transport (last)** | {net_last:.1f} ms |",
+            ])
+
+        lines.extend([
+            f"| **Queue headroom** | {headroom * 1000:.0f} ms |",
+            f"| Samples | {n} |",
+        ])
+
+        md = "\n".join(lines)
         rr.log("inference/stats", rr.TextDocument(md, media_type=rr.MediaType.MARKDOWN))
 
 

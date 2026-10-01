@@ -425,6 +425,7 @@ class ZenohRemoteExecution(Execution):
                             latency_s=latency,
                             offset=offset,
                             chunk=actions,
+                            server_latency_s=server_latency,
                         )
                     )
         except Exception as error:
