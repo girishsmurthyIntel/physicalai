@@ -38,14 +38,14 @@ class PolicySource(ActionSource):
 
     def __init__(
         self,
-        model: InferenceModel,
+        model: InferenceModel | None = None,
         execution: Execution | None = None,
         action_queue: ActionQueue | None = None,
         *,
         task: str | None = None,
     ) -> None:
         """Initialize a policy-backed action source."""
-        self._model = model
+        self._model = model  # type: ignore[assignment]
         self._execution = execution or SyncExecution()
         self._action_queue = action_queue or ChunkedActionQueue(
             smoother=LerpSmoother(duration_frames=_DEFAULT_LERP_FRAMES)

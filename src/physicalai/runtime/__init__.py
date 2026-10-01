@@ -35,6 +35,11 @@ from physicalai.runtime.execution import (
     SyncExecution,
     WorkerDiedError,
 )
+try:
+    from physicalai.runtime.execution import ZenohRemoteExecution, ZenohRemoteInferenceServer
+except ImportError:
+    ZenohRemoteExecution = None  # type: ignore[assignment,misc]
+    ZenohRemoteInferenceServer = None  # type: ignore[assignment,misc]
 from physicalai.runtime.smoothers import ChunkSmoother, LerpSmoother, ReplaceSmoother
 
 __all__ = [
@@ -65,4 +70,6 @@ __all__ = [
     "TeleopSource",
     "TickEvent",
     "WorkerDiedError",
+    "ZenohRemoteExecution",
+    "ZenohRemoteInferenceServer",
 ]

@@ -208,12 +208,15 @@ class ZenohRemoteInferenceServer:
 
     def stop(self) -> None:
         self._stop_event.set()
-        if self._queryable is not None:
-            self._queryable.undeclare()
-            self._queryable = None
         if self._executor is not None:
             self._executor.shutdown(wait=True)
             self._executor = None
+        if self._queryable is not None:
+            import contextlib
+
+            with contextlib.suppress(Exception):
+                self._queryable.undeclare()
+            self._queryable = None
         if self._session is not None:
             self._session.close()
             self._session = None
@@ -282,7 +285,7 @@ class ZenohRemoteExecution(Execution):
         self._bus: _CallbackBus | None = None
         self._session_id = ""
 
-    def start(self, model: InferenceModel, action_queue: ActionQueue) -> None:
+    def start(self, model: InferenceModel | None = None, action_queue: ActionQueue | None = None) -> None:
         self.stop()
         if self._thread is not None and self._thread.is_alive():
             raise RuntimeError("Zenoh inference worker is still running")
@@ -413,7 +416,8 @@ class ZenohRemoteExecution(Execution):
                     self._running_inference = False
                 self._inference_count += 1
                 if self._bus:
-                    from physicalai.runtime.events import InferenceEvent
+                    from physicalai.runtime.events import InferenceEvent  # noqa: PLC0415
+
                     self._bus.emit_inference(
                         InferenceEvent(
                             session_id=self._session_id,
@@ -421,7 +425,6 @@ class ZenohRemoteExecution(Execution):
                             latency_s=latency,
                             offset=offset,
                             chunk=actions,
-                            server_inference_latency_s=server_latency,
                         )
                     )
         except Exception as error:
