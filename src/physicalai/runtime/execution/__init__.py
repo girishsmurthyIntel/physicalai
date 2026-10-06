@@ -12,14 +12,6 @@ from physicalai.runtime.execution.rtc import RTCExecution
 from physicalai.runtime.execution.rtc_queue import RTCActionQueue
 from physicalai.runtime.execution.sync import SyncExecution
 
-try:
-    from physicalai.runtime.execution.zenoh_remote_execution import (
-        ZenohRemoteExecution,
-        ZenohRemoteInferenceServer,
-    )
-except ImportError:
-    pass
-
 __all__ = [
     "ActionQueue",
     "AsyncExecution",
@@ -29,6 +21,4 @@ __all__ = [
     "RTCExecution",
     "SyncExecution",
     "WorkerDiedError",
-    "ZenohRemoteExecution",
-    "ZenohRemoteInferenceServer",
 ]

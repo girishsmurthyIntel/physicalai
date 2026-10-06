@@ -468,6 +468,7 @@ class RTCExecution(Execution):
                             self._cancel_signal_locked(signal, "RTCExecution warmup cancelled by reset")
                             continue
                     outputs = self._model(inputs)
+                    server_latency = getattr(self._model, "last_server_latency_s", None)
                     elapsed = time.perf_counter() - t0
                 consecutive_errors = 0
             except Exception:
@@ -516,6 +517,7 @@ class RTCExecution(Execution):
                         latency_s=elapsed,
                         offset=0,
                         chunk=processed_actions,
+                        server_latency_s=server_latency,
                     )
                 )
 

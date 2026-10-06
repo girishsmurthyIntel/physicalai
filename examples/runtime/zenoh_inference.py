@@ -16,7 +16,7 @@ Usage examples:
   # 2. Run benchmark with custom chunk size and request count:
   uv run python examples/runtime/zenoh_inference.py --mode loopback --requests 50 --chunk-size 32
 
-  # 3. Dedicated server mode (listens on Zenoh key / endpoint):
+    # 3. Dedicated server mode (serves one model namespace):
   uv run python examples/runtime/zenoh_inference.py --mode server --endpoint tcp/127.0.0.1:7447
 
   # 4. Dedicated client mode:
@@ -33,9 +33,13 @@ from typing import Any
 
 import numpy as np
 
-from physicalai.runtime.execution.queue import ChunkedActionQueue
-from physicalai.runtime.execution.zenoh_remote_execution import (
-    ZenohRemoteExecution,
+from physicalai.runtime import (
+    AsyncExecution,
+    ChunkedActionQueue,
+    RTCActionQueue,
+    RTCExecution,
+    SyncExecution,
+    ZenohRemoteInferenceModel,
     ZenohRemoteInferenceServer,
 )
 
@@ -59,6 +63,9 @@ class SyntheticInferenceModel:
         base = np.arange(self.action_dim, dtype=np.float32)[None, :]
         return np.sin(t + base)
 
+    def __call__(self, inputs: dict[str, Any]) -> dict[str, np.ndarray]:
+        return {"action": self.predict_action_chunk(inputs)[np.newaxis]}
+
     def reset(self) -> None:
         self.reset_count += 1
 
@@ -66,24 +73,33 @@ class SyntheticInferenceModel:
 def make_sample_observation(image_h: int = 224, image_w: int = 224, joint_dim: int = 6) -> dict[str, Any]:
     """Generate sample observation containing RGB image and joint positions."""
     return {
+        "state": np.random.randn(1, joint_dim).astype(np.float32),
         "overhead": np.random.randint(0, 256, (image_h, image_w, 3), dtype=np.uint8),
         "joint_positions": np.random.randn(joint_dim).astype(np.float32),
     }
 
 
-def run_server(key_expr: str, endpoint: str | None, simulated_latency_ms: float, chunk_size: int) -> None:
-    print(f"[Server] Starting Zenoh Remote Inference Server on key '{key_expr}'...")
-    if endpoint:
-        print(f"[Server] Listening on endpoint: {endpoint}")
+def run_server(
+    model_name: str,
+    endpoint: str | None,
+    listen_host: str,
+    server_port: int | None,
+    simulated_latency_ms: float,
+    chunk_size: int,
+) -> None:
+    print(f"[Server] Starting Zenoh Remote Inference Server for model '{model_name}'...")
     model = SyntheticInferenceModel(
         chunk_size=chunk_size,
         simulated_inference_s=simulated_latency_ms / 1000.0,
     )
     server = ZenohRemoteInferenceServer(
         model=model,  # type: ignore[arg-type]
-        key_expr=key_expr,
+        model_name=model_name,
         listen_endpoint=endpoint,
+        listen_host=listen_host,
+        listen_port=server_port,
     )
+    print(f"[Server] Listening on endpoint: {server.listen_endpoint}")
     try:
         print("[Server] Server is running. Press Ctrl+C to terminate.")
         server.serve_forever()
@@ -95,53 +111,81 @@ def run_server(key_expr: str, endpoint: str | None, simulated_latency_ms: float,
 
 
 def run_client(
-    key_expr: str,
+    model_name: str,
     endpoint: str | None,
+    server_host: str,
+    server_port: int | None,
+    execution_mode: str,
     num_requests: int,
     warmup_requests: int,
+    startup_timeout_s: float = 0.0,
 ) -> None:
-    print(f"[Client] Connecting to Zenoh key '{key_expr}'...")
-    if endpoint:
-        print(f"[Client] Target endpoint: {endpoint}")
+    print(f"[Client] Connecting to model '{model_name}' on {server_host}...")
 
-    execution = ZenohRemoteExecution(
+    model = ZenohRemoteInferenceModel(
         endpoint=endpoint,
-        key_expr=key_expr,
+        model_name=model_name,
+        server_host=server_host,
+        server_port=server_port,
         request_timeout_s=10.0,
     )
-    queue = ChunkedActionQueue()
+    if execution_mode == "sync":
+        execution = SyncExecution()
+        queue = ChunkedActionQueue()
+    elif execution_mode == "async":
+        execution = AsyncExecution()
+        queue = ChunkedActionQueue()
+    else:
+        execution = RTCExecution(
+            chunk_size=model.chunk_size,
+            execution_horizon=max(1, model.chunk_size // 2),
+            fps=30.0,
+        )
+        queue = RTCActionQueue()
 
-    # Initialize execution
-    dummy_model = SyntheticInferenceModel()
-    execution.start(dummy_model, queue)  # type: ignore[arg-type]
+    deadline = time.monotonic() + startup_timeout_s
+    while True:
+        try:
+            execution.start(model, queue)
+            break
+        except Exception:
+            if time.monotonic() >= deadline:
+                model.close()
+                raise
+            time.sleep(0.1)
 
     sample_obs = make_sample_observation()
 
     try:
         print(f"[Client] Running warmup ({warmup_requests} request(s))...")
-        for _ in range(warmup_requests):
-            execution.warmup(sample_obs)
-        print(f"[Client] Warmup successful. Chunk size: {execution.chunk_size}")
+        execution.warmup(sample_obs)
+        for _ in range(max(0, warmup_requests - 1)):
+            model.predict_action_chunk(sample_obs)
+        print(f"[Client] Warmup successful. Chunk size: {model.chunk_size}")
 
-        print(f"[Client] Resetting remote policy...")
         execution.reset(reset_model=True)
+        queue.reset()
 
         print(f"[Client] Benchmarking {num_requests} inference requests...")
         latencies_ms: list[float] = []
 
         for i in range(num_requests):
-            # Consume queue items to simulate robot popping actions
-            while queue.remaining > 0:
-                queue.pop()
+            if execution_mode == "rtc":
+                while not queue.below_threshold(execution.queue_threshold):
+                    queue.pop()
+            else:
+                while queue.remaining > 0:
+                    queue.pop()
 
+            previous_inference_count = execution.inference_count
             start_t = time.perf_counter()
             execution.maybe_request(sample_obs)
 
-            # Wait for inference thread to push the new chunk
+            # Wait for the selected execution strategy to complete its refill.
             deadline = time.perf_counter() + 5.0
-            while queue.remaining == 0:
+            while execution.inference_count == previous_inference_count:
                 if time.perf_counter() > deadline:
-                    raise TimeoutError(f"Request {i + 1} timed out waiting for action chunk")
+                    raise TimeoutError(f"Request {i + 1} timed out waiting for inference")
                 time.sleep(0.0005)
 
             elapsed_ms = (time.perf_counter() - start_t) * 1000.0
@@ -150,7 +194,7 @@ def run_client(
         # Print statistics
         latencies = np.array(latencies_ms)
         print("\n" + "=" * 50)
-        print(" Zenoh Remote Inference Benchmark Results")
+        print(f" Zenoh Remote Inference Benchmark ({execution_mode})")
         print("=" * 50)
         print(f"Total Requests  : {num_requests}")
         print(f"Total Time      : {latencies.sum() / 1000.0:.3f} s")
@@ -162,35 +206,52 @@ def run_client(
         print(f"Latency P95     : {np.percentile(latencies, 95):.2f} ms")
         print(f"Latency P99     : {np.percentile(latencies, 99):.2f} ms")
         print("=" * 50 + "\n")
-
     finally:
         execution.stop()
+        model.close()
         print("[Client] Disconnected.")
 
 
 def run_loopback(
-    key_expr: str,
+    model_name: str,
+    execution_mode: str,
     requests: int,
     warmup: int,
     chunk_size: int,
     simulated_latency_ms: float,
 ) -> None:
-    print(f"[Loopback] Setting up in-process Zenoh server & client on key '{key_expr}'...")
+    import socket
+
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        port = probe.getsockname()[1]
+    endpoint = f"tcp/127.0.0.1:{port}"
+    print(f"[Loopback] Setting up model '{model_name}' on {endpoint}...")
     model = SyntheticInferenceModel(chunk_size=chunk_size, simulated_inference_s=simulated_latency_ms / 1000.0)
-    server = ZenohRemoteInferenceServer(model=model, key_expr=key_expr)  # type: ignore[arg-type]
+    server = ZenohRemoteInferenceServer(
+        model=model,
+        model_name=model_name,
+        listen_endpoint=endpoint,
+    )  # type: ignore[arg-type]
 
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
 
-    # Small delay for queryable registration
-    time.sleep(0.2)
+    if not server.wait_until_ready(timeout_s=10.0):
+        server.stop()
+        server_thread.join(timeout=3.0)
+        raise TimeoutError("Zenoh inference router did not become ready")
 
     try:
         run_client(
-            key_expr=key_expr,
-            endpoint=None,
+            model_name=model_name,
+            endpoint=endpoint,
+            server_host="127.0.0.1",
+            server_port=port,
+            execution_mode=execution_mode,
             num_requests=requests,
             warmup_requests=warmup,
+            startup_timeout_s=10.0,
         )
     finally:
         print("[Loopback] Stopping server...")
@@ -211,14 +272,36 @@ def main() -> None:
         help="Evaluation mode: loopback (both in one process), server, or client",
     )
     parser.add_argument(
-        "--key",
-        default="physicalai/inference/eval",
-        help="Zenoh key expression for inference query/reply",
+        "--model-name",
+        default="eval",
+        help="Model identity used to namespace inference keys and validate startup",
+    )
+    parser.add_argument(
+        "--execution-mode",
+        choices=("sync", "async", "rtc"),
+        default="async",
+        help="Scheduling strategy used with the same remote model",
     )
     parser.add_argument(
         "--endpoint",
         default=None,
-        help="Zenoh network endpoint (e.g., tcp/127.0.0.1:7447 or udp/127.0.0.1:7447)",
+        help="Explicit Zenoh endpoint override; otherwise the port is derived from --model-name",
+    )
+    parser.add_argument(
+        "--server-host",
+        default="127.0.0.1",
+        help="Server host to connect to in client mode",
+    )
+    parser.add_argument(
+        "--listen-host",
+        default="0.0.0.0",
+        help="Host to bind in server mode",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=None,
+        help="Optional fixed port; defaults to a deterministic port derived from --model-name",
     )
     parser.add_argument(
         "--requests",
@@ -249,21 +332,27 @@ def main() -> None:
 
     if args.mode == "server":
         run_server(
-            key_expr=args.key,
+            model_name=args.model_name,
             endpoint=args.endpoint,
+            listen_host=args.listen_host,
+            server_port=args.port,
             simulated_latency_ms=args.simulated_latency_ms,
             chunk_size=args.chunk_size,
         )
     elif args.mode == "client":
         run_client(
-            key_expr=args.key,
+            model_name=args.model_name,
             endpoint=args.endpoint,
+            server_host=args.server_host,
+            server_port=args.port,
+            execution_mode=args.execution_mode,
             num_requests=args.requests,
             warmup_requests=args.warmup,
         )
     else:
         run_loopback(
-            key_expr=args.key,
+            model_name=args.model_name,
+            execution_mode=args.execution_mode,
             requests=args.requests,
             warmup=args.warmup,
             chunk_size=args.chunk_size,
