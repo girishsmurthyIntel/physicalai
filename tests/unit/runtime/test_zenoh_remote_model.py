@@ -24,9 +24,9 @@ from physicalai.runtime.execution.rtc import RTCExecution  # noqa: E402
 from physicalai.runtime.execution.rtc_queue import RTCActionQueue  # noqa: E402
 from physicalai.runtime.execution.sync import SyncExecution  # noqa: E402
 from physicalai.runtime.zenoh_remote import (  # noqa: E402
-    ZenohRemoteInferenceModel,
+    RemoteInferenceModel,
     ZenohRemoteInferenceError,
-    ZenohRemoteInferenceServer,
+    RemoteInferenceServer,
     _decode_observation,
     _decode_payload,
     _encode_observation,
@@ -64,15 +64,15 @@ def _free_endpoint() -> str:
 def test_client_rejects_server_with_different_model_namespace() -> None:
     model_b = _Model("model-b")
     endpoint_b = _free_endpoint()
-    server_b = ZenohRemoteInferenceServer(model_b, listen_endpoint=endpoint_b)
+    server_b = RemoteInferenceServer(model_b, listen_endpoint=endpoint_b)
     server_thread = threading.Thread(target=server_b.serve_forever, daemon=True)
     server_thread.start()
     assert server_b.wait_until_ready(timeout_s=5.0)
 
     with pytest.raises(ZenohRemoteInferenceError):
-        ZenohRemoteInferenceModel(endpoint_b, "model-a", request_timeout_s=0.5)
+        RemoteInferenceModel(endpoint_b, "model-a", request_timeout_s=0.5)
 
-    client_for_b = ZenohRemoteInferenceModel(endpoint_b, "model-b", request_timeout_s=0.5)
+    client_for_b = RemoteInferenceModel(endpoint_b, "model-b", request_timeout_s=0.5)
     try:
         actions = client_for_b.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
         assert actions.shape == (4, 3)
@@ -89,7 +89,7 @@ def test_client_rejects_server_with_different_model_namespace() -> None:
 def test_server_and_client_derive_port_from_model_namespace() -> None:
     model_name = "pi05-port-test"
     key_prefix = f"physicalai/inference/{model_name}"
-    server = ZenohRemoteInferenceServer(
+    server = RemoteInferenceServer(
         _Model(model_name),
         model_name=model_name,
         listen_host="127.0.0.1",
@@ -99,7 +99,7 @@ def test_server_and_client_derive_port_from_model_namespace() -> None:
     assert server.wait_until_ready(timeout_s=5.0)
     client = None
     try:
-        client = ZenohRemoteInferenceModel(model_name=model_name, server_host="127.0.0.1")
+        client = RemoteInferenceModel(model_name=model_name, server_host="127.0.0.1")
         assert server.listen_endpoint == endpoint_for_key(key_prefix, "127.0.0.1")
         assert client.endpoint == endpoint_for_key(key_prefix, "127.0.0.1")
     finally:
@@ -113,12 +113,12 @@ def test_server_and_client_derive_port_from_model_namespace() -> None:
 def test_sync_async_and_rtc_use_the_same_remote_model_interface() -> None:
     model_name = "execution-mode-check"
     served_model = _Model(model_name)
-    server = ZenohRemoteInferenceServer(served_model, model_name=model_name, listen_host="127.0.0.1")
+    server = RemoteInferenceServer(served_model, model_name=model_name, listen_host="127.0.0.1")
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
     assert server.wait_until_ready(timeout_s=5.0)
 
-    model = ZenohRemoteInferenceModel(
+    model = RemoteInferenceModel(
         model_name=model_name,
         server_host="127.0.0.1",
         server_port=int(server.listen_endpoint.rsplit(":", 1)[1]),

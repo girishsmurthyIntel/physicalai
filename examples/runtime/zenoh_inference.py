@@ -39,8 +39,8 @@ from physicalai.runtime import (
     RTCActionQueue,
     RTCExecution,
     SyncExecution,
-    ZenohRemoteInferenceModel,
-    ZenohRemoteInferenceServer,
+    RemoteInferenceModel,
+    RemoteInferenceServer,
 )
 
 
@@ -92,7 +92,7 @@ def run_server(
         chunk_size=chunk_size,
         simulated_inference_s=simulated_latency_ms / 1000.0,
     )
-    server = ZenohRemoteInferenceServer(
+    server = RemoteInferenceServer(
         model=model,  # type: ignore[arg-type]
         model_name=model_name,
         listen_endpoint=endpoint,
@@ -122,7 +122,7 @@ def run_client(
 ) -> None:
     print(f"[Client] Connecting to model '{model_name}' on {server_host}...")
 
-    model = ZenohRemoteInferenceModel(
+    model = RemoteInferenceModel(
         endpoint=endpoint,
         model_name=model_name,
         server_host=server_host,
@@ -228,7 +228,7 @@ def run_loopback(
     endpoint = f"tcp/127.0.0.1:{port}"
     print(f"[Loopback] Setting up model '{model_name}' on {endpoint}...")
     model = SyntheticInferenceModel(chunk_size=chunk_size, simulated_inference_s=simulated_latency_ms / 1000.0)
-    server = ZenohRemoteInferenceServer(
+    server = RemoteInferenceServer(
         model=model,
         model_name=model_name,
         listen_endpoint=endpoint,

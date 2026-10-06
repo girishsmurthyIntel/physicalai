@@ -38,12 +38,12 @@ from physicalai.runtime.execution import (
 
 try:
     from physicalai.runtime.zenoh_remote import (
-        ZenohRemoteInferenceModel,
-        ZenohRemoteInferenceServer,
+        RemoteInferenceModel,
+        RemoteInferenceServer,
     )
 except ImportError:
-    ZenohRemoteInferenceModel = None  # type: ignore[assignment,misc]
-    ZenohRemoteInferenceServer = None  # type: ignore[assignment,misc]
+    RemoteInferenceModel = None  # type: ignore[assignment,misc]
+    RemoteInferenceServer = None  # type: ignore[assignment,misc]
 from physicalai.runtime.smoothers import ChunkSmoother, LerpSmoother, ReplaceSmoother
 
 __all__ = [
@@ -74,6 +74,6 @@ __all__ = [
     "TeleopSource",
     "TickEvent",
     "WorkerDiedError",
-    "ZenohRemoteInferenceModel",
-    "ZenohRemoteInferenceServer",
+    "RemoteInferenceModel",
+    "RemoteInferenceServer",
 ]

@@ -300,7 +300,7 @@ def _payload_bytes(payload: Any) -> bytes:
     return bytes(payload)
 
 
-class ZenohRemoteInferenceServer:
+class RemoteInferenceServer:
     """Serve an inference model through a Zenoh queryable."""
 
     def __init__(
@@ -449,8 +449,8 @@ class ZenohRemoteInferenceServer:
             query.reply_err(str(error).encode("utf-8"))
 
 
-@export_config(class_path="physicalai.runtime.ZenohRemoteInferenceModel")
-class ZenohRemoteInferenceModel(InferenceModel):
+@export_config(class_path="physicalai.runtime.RemoteInferenceModel")
+class RemoteInferenceModel(InferenceModel):
     """InferenceModel-compatible client proxy for a policy served over Zenoh.
 
     It implements both ``predict_action_chunk`` and ``__call__`` so the existing
