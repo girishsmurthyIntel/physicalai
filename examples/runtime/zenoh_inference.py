@@ -26,22 +26,21 @@ Usage examples:
 from __future__ import annotations
 
 import argparse
-import sys
 import threading
 import time
 from typing import Any
 
 import numpy as np
 
+from physicalai.inference.remote import InferenceServer, RemoteInferenceModel, RemoteInferenceUnavailableError
 from physicalai.runtime import (
     AsyncExecution,
     ChunkedActionQueue,
     RTCActionQueue,
     RTCExecution,
     SyncExecution,
-    RemoteInferenceModel,
-    RemoteInferenceServer,
 )
+from physicalai.transport._zenoh import endpoint_for_key, model_key_prefix
 
 
 class SyntheticInferenceModel:
@@ -84,6 +83,7 @@ def run_server(
     endpoint: str | None,
     listen_host: str,
     server_port: int | None,
+    allow_all_interfaces: bool,
     simulated_latency_ms: float,
     chunk_size: int,
 ) -> None:
@@ -92,15 +92,16 @@ def run_server(
         chunk_size=chunk_size,
         simulated_inference_s=simulated_latency_ms / 1000.0,
     )
-    server = RemoteInferenceServer(
+    listen = endpoint or endpoint_for_key(model_key_prefix(model_name), listen_host, server_port)
+    server = InferenceServer(
         model=model,  # type: ignore[arg-type]
-        model_name=model_name,
-        listen_endpoint=endpoint,
-        listen_host=listen_host,
-        listen_port=server_port,
+        name=model_name,
+        listen=listen,
+        allow_all_interfaces=allow_all_interfaces,
     )
-    print(f"[Server] Listening on endpoint: {server.listen_endpoint}")
     try:
+        server.start()
+        print(f"[Server] Listening on endpoint: {server.endpoint}")
         print("[Server] Server is running. Press Ctrl+C to terminate.")
         server.serve_forever()
     except KeyboardInterrupt:
@@ -120,15 +121,25 @@ def run_client(
     warmup_requests: int,
     startup_timeout_s: float = 0.0,
 ) -> None:
-    print(f"[Client] Connecting to model '{model_name}' on {server_host}...")
+    remote_endpoint = endpoint or endpoint_for_key(model_key_prefix(model_name), server_host, server_port)
+    print(f"[Client] Connecting to model '{model_name}' at {remote_endpoint}...")
 
     model = RemoteInferenceModel(
-        endpoint=endpoint,
-        model_name=model_name,
-        server_host=server_host,
-        server_port=server_port,
-        request_timeout_s=10.0,
+        name=model_name,
+        endpoint=remote_endpoint,
+        request_timeout_s=2.0,
     )
+    deadline = time.monotonic() + startup_timeout_s
+    while True:
+        try:
+            model.connect()
+            break
+        except RemoteInferenceUnavailableError:
+            if time.monotonic() >= deadline:
+                model.close()
+                raise
+            time.sleep(0.1)
+
     if execution_mode == "sync":
         execution = SyncExecution()
         queue = ChunkedActionQueue()
@@ -143,16 +154,7 @@ def run_client(
         )
         queue = RTCActionQueue()
 
-    deadline = time.monotonic() + startup_timeout_s
-    while True:
-        try:
-            execution.start(model, queue)
-            break
-        except Exception:
-            if time.monotonic() >= deadline:
-                model.close()
-                raise
-            time.sleep(0.1)
+    execution.start(model, queue)
 
     sample_obs = make_sample_observation()
 
@@ -228,19 +230,15 @@ def run_loopback(
     endpoint = f"tcp/127.0.0.1:{port}"
     print(f"[Loopback] Setting up model '{model_name}' on {endpoint}...")
     model = SyntheticInferenceModel(chunk_size=chunk_size, simulated_inference_s=simulated_latency_ms / 1000.0)
-    server = RemoteInferenceServer(
+    server = InferenceServer(
         model=model,
-        model_name=model_name,
-        listen_endpoint=endpoint,
+        name=model_name,
+        listen=endpoint,
     )  # type: ignore[arg-type]
 
+    server.start()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
     server_thread.start()
-
-    if not server.wait_until_ready(timeout_s=10.0):
-        server.stop()
-        server_thread.join(timeout=3.0)
-        raise TimeoutError("Zenoh inference router did not become ready")
 
     try:
         run_client(
@@ -294,8 +292,13 @@ def main() -> None:
     )
     parser.add_argument(
         "--listen-host",
-        default="0.0.0.0",
-        help="Host to bind in server mode",
+        default="127.0.0.1",
+        help="Loopback host to bind in server mode (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--allow-all-interfaces",
+        action="store_true",
+        help="Permit a non-loopback listen host in server mode",
     )
     parser.add_argument(
         "--port",
@@ -336,6 +339,7 @@ def main() -> None:
             endpoint=args.endpoint,
             listen_host=args.listen_host,
             server_port=args.port,
+            allow_all_interfaces=args.allow_all_interfaces,
             simulated_latency_ms=args.simulated_latency_ms,
             chunk_size=args.chunk_size,
         )

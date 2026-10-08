@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
@@ -15,6 +16,14 @@ if TYPE_CHECKING:
 
 _PORT_BASE = 20000
 _PORT_RANGE = 40000
+_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
+
+
+def model_key_prefix(model_name: str) -> str:
+    """Return the validated inference namespace for a model name."""
+    if not _MODEL_NAME_RE.fullmatch(model_name) or model_name in {".", ".."}:
+        raise ValueError("model_name must be a non-empty key segment containing only letters, digits, '.', '_' or '-'")
+    return f"physicalai/inference/{model_name}"
 
 
 def derive_endpoint_port(key_prefix: str) -> int:

@@ -27,10 +27,22 @@ Examples:
 # the ``physicalai`` namespace (e.g. the ``physicalai-train`` library, which
 # ships the torch and executorch adapters under ``physicalai.inference.adapters``).
 from pkgutil import extend_path
+from typing import TYPE_CHECKING
 
 __path__ = extend_path(__path__, __name__)
 
 from physicalai.inference.callbacks.base import Callback
 from physicalai.inference.model import InferenceModel
 
-__all__ = ["Callback", "InferenceModel"]
+if TYPE_CHECKING:
+    from physicalai.inference.remote import InferenceServer, RemoteInferenceModel
+
+__all__ = ["Callback", "InferenceModel", "InferenceServer", "RemoteInferenceModel"]
+
+
+def __getattr__(name: str) -> object:
+    if name in {"InferenceServer", "RemoteInferenceModel"}:
+        from physicalai.inference.remote import InferenceServer, RemoteInferenceModel
+
+        return {"InferenceServer": InferenceServer, "RemoteInferenceModel": RemoteInferenceModel}[name]
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

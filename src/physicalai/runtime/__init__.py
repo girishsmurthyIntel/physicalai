@@ -37,13 +37,13 @@ from physicalai.runtime.execution import (
 )
 
 try:
-    from physicalai.runtime.zenoh_remote import (
+    from physicalai.inference.remote import (
+        InferenceServer,
         RemoteInferenceModel,
-        RemoteInferenceServer,
     )
 except ImportError:
+    InferenceServer = None  # type: ignore[assignment,misc]
     RemoteInferenceModel = None  # type: ignore[assignment,misc]
-    RemoteInferenceServer = None  # type: ignore[assignment,misc]
 from physicalai.runtime.smoothers import ChunkSmoother, LerpSmoother, ReplaceSmoother
 
 __all__ = [
@@ -56,6 +56,7 @@ __all__ = [
     "ConsoleCallback",
     "Execution",
     "InferenceEvent",
+    "InferenceServer",
     "JsonlCallback",
     "LerpSmoother",
     "LifecycleEvent",
@@ -75,5 +76,4 @@ __all__ = [
     "TickEvent",
     "WorkerDiedError",
     "RemoteInferenceModel",
-    "RemoteInferenceServer",
 ]

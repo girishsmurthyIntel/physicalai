@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 import socket
 
-from physicalai._zenoh import derive_endpoint_port as _derive_endpoint_port
+from physicalai.transport._zenoh import derive_endpoint_port as _derive_endpoint_port
 
 KEY_PREFIX = "physicalai/robot"
 

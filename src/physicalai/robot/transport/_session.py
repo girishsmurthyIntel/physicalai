@@ -15,7 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-from physicalai._zenoh import endpoint_for_key, open_zenoh_session
+from physicalai.transport._zenoh import endpoint_for_key, open_zenoh_session
 
 from ._ids import robot_prefix
 
