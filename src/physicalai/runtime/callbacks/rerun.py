@@ -75,6 +75,7 @@ class RerunCallback:
         self._camera_names: list[str] | None = None
         self._latencies: deque[float] = deque(maxlen=200)
         self._server_latencies: deque[float] = deque(maxlen=200)
+        self._server_queues: deque[float] = deque(maxlen=200)
 
     def on_lifecycle(self, event: LifecycleEvent) -> None:  # noqa: D102
         if event.event == "start" and not self._initialized:
@@ -168,7 +169,13 @@ class RerunCallback:
         if event.server_latency_s is not None:
             self._server_latencies.append(event.server_latency_s)
             rr.log("inference/server_latency_ms", rr.Scalars(event.server_latency_s * 1000.0))
-            transport_serialization_ms = max(0.0, (event.latency_s - event.server_latency_s) * 1000.0)
+            server_queue_s = event.server_queue_s or 0.0
+            self._server_queues.append(server_queue_s)
+            rr.log("inference/server_queue_ms", rr.Scalars(server_queue_s * 1000.0))
+            transport_serialization_ms = max(
+                0.0,
+                (event.latency_s - event.server_latency_s - server_queue_s) * 1000.0,
+            )
             rr.log("inference/transport_and_serialization_ms", rr.Scalars(transport_serialization_ms))
 
         # Inference latency stats as a live-updating table.
@@ -369,10 +376,12 @@ class RerunCallback:
             server_arr = np.array(self._server_latencies)
             s_last = float(server_arr[-1])
             s_p50 = float(np.percentile(server_arr, 50))
-            transport_last = max(0.0, (last - s_last) * 1000.0)
+            queue_last = self._server_queues[-1] if self._server_queues else 0.0
+            transport_last = max(0.0, (last - s_last - queue_last) * 1000.0)
             lines.extend([
                 f"| **Server Compute (last)** | {s_last * 1000:.1f} ms |",
                 f"| **Server Compute (p50)** | {s_p50 * 1000:.1f} ms |",
+                f"| **Server Queue (last)** | {queue_last * 1000:.1f} ms |",
                 f"| **Transport + (de)serialisation (last)** | {transport_last:.1f} ms |",
             ])
 

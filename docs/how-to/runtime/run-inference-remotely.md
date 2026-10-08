@@ -36,9 +36,12 @@ To load directly from the Hugging Face Hub instead, replace `--export-dir ...` w
 ```bash
 uv run physicalai inference serve --name cell1-act \
   --hub-id ORG/REPO \
+  --revision COMMIT_SHA \
   --backend openvino \
   --device GPU
 ```
+
+Pin `--revision` to a reviewed commit SHA for reproducible Hub deployments. If omitted, the Hub's default revision is used.
 
 The server defaults to `tcp/127.0.0.1:P` and prints an SSH tunnel command. This is the recommended setup: SSH key authentication and encryption protect the connection, and the client leaves `endpoint` unset so it connects through the local forwarded port. On the client, run the printed command, or:
 

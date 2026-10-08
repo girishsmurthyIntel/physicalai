@@ -52,6 +52,49 @@ def test_serve_parser_accepts_required_name_and_export_source() -> None:
     assert cfg.serve.listen == "tcp/127.0.0.1:12345"
 
 
+def test_serve_forwards_hub_revision(monkeypatch: pytest.MonkeyPatch) -> None:
+    import physicalai.inference as inference_package
+    import physicalai.inference.remote as remote_package
+
+    captured: dict[str, object] = {}
+
+    class _ModelLoader:
+        @classmethod
+        def from_pretrained(cls, hub_id: str, **kwargs: object) -> object:
+            captured["hub_id"] = hub_id
+            captured.update(kwargs)
+            return object()
+
+    class _Server:
+        endpoint = "tcp/127.0.0.1:12345"
+
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            pass
+
+        def start(self) -> None:
+            pass
+
+        def serve_forever(self) -> None:
+            pass
+
+        def stop(self) -> None:
+            pass
+
+    monkeypatch.setattr(inference_package, "InferenceModel", _ModelLoader)
+    monkeypatch.setattr(remote_package, "InferenceServer", _Server)
+    parser = inference.build_parser()
+    cfg = parser.parse_args([
+        "serve",
+        "--name=pi05",
+        "--hub-id=ORG/REPO",
+        "--revision=0123456789abcdef0123456789abcdef01234567",
+    ])
+
+    assert inference._dispatch(parser, cfg) == 0  # noqa: SLF001
+    assert captured["hub_id"] == "ORG/REPO"
+    assert captured["revision"] == "0123456789abcdef0123456789abcdef01234567"
+
+
 def test_serve_requires_name_and_exactly_one_model_source() -> None:
     parser = inference.build_parser()
 

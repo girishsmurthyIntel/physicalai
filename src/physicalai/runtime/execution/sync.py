@@ -79,6 +79,7 @@ class SyncExecution(Execution):
                 actions = self._model.predict_action_chunk(observation)
                 timing = getattr(self._model, "last_timing", None)
                 server_latency = getattr(timing, "server_compute_s", None)
+                server_queue = getattr(timing, "server_queue_s", None)
                 latency = time.perf_counter() - t0
                 self._queue.push_chunk(actions, offset=0)
             self._inference_count += 1
@@ -93,6 +94,7 @@ class SyncExecution(Execution):
                         offset=0,
                         chunk=actions,
                         server_latency_s=server_latency,
+                        server_queue_s=server_queue,
                     )
                 )
 

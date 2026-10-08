@@ -307,15 +307,24 @@ class TestRerunCallbackInference:
             offset=0,
             chunk=np.zeros((4, 2), dtype=np.float32),
             server_latency_s=0.02,
+            server_queue_s=0.01,
         )
 
         cb.on_inference(event)
 
         paths = [call.args[0] for call in mock_rerun.log.call_args_list]
         assert "inference/server_latency_ms" in paths
+        assert "inference/server_queue_ms" in paths
         assert "inference/transport_and_serialization_ms" in paths
         assert "inference/network_latency_ms" not in paths
+        transport = next(
+            call.args[1][1][0]
+            for call in mock_rerun.log.call_args_list
+            if call.args[0] == "inference/transport_and_serialization_ms"
+        )
+        assert transport == pytest.approx(20.0)
         table = mock_rerun.TextDocument.call_args.args[0]
+        assert "Server Queue (last)" in table
         assert "Transport + (de)serialisation (last)" in table
 
     def test_inference_resets_time_to_current_step(self, make_callback: Any, mock_rerun: MagicMock) -> None:

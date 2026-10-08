@@ -73,7 +73,7 @@ def make_sample_observation(image_h: int = 224, image_w: int = 224, joint_dim: i
     """Generate sample observation containing RGB image and joint positions."""
     return {
         "state": np.random.randn(1, joint_dim).astype(np.float32),
-        "overhead": np.random.randint(0, 256, (image_h, image_w, 3), dtype=np.uint8),
+        "images.overhead": np.random.randint(0, 256, (image_h, image_w, 3), dtype=np.uint8),
         "joint_positions": np.random.randn(joint_dim).astype(np.float32),
     }
 

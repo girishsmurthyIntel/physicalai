@@ -43,6 +43,11 @@ def _build_serve_parser() -> ArgumentParser:
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--export-dir", type=Path, help="Exported inference model directory")
     source.add_argument("--hub-id", help="Hugging Face repository or local model path")
+    parser.add_argument(
+        "--revision",
+        default=None,
+        help="Hub revision; use a reviewed commit SHA for reproducible model loading",
+    )
     parser.add_argument("--policy-name", default=None, help="Policy name; auto-detected from the export if omitted")
     parser.add_argument("--backend", choices=("auto", "openvino", "onnx"), default="auto", help="Inference backend")
     parser.add_argument("--device", default="auto", help="Inference device")
@@ -96,6 +101,7 @@ def _serve(cfg: Namespace) -> int:
     else:
         model = InferenceModel.from_pretrained(
             cfg.hub_id,
+            revision=cfg.revision,
             policy_name=cfg.policy_name,
             backend=cfg.backend,
             device=cfg.device,

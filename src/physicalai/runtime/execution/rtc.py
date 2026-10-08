@@ -482,6 +482,7 @@ class RTCExecution(Execution):
                     outputs = self._model(inputs)
                     timing = getattr(self._model, "last_timing", None)
                     server_latency = getattr(timing, "server_compute_s", None)
+                    server_queue = getattr(timing, "server_queue_s", None)
                     elapsed = time.perf_counter() - t0
                 consecutive_errors = 0
             except Exception:
@@ -531,6 +532,7 @@ class RTCExecution(Execution):
                         offset=0,
                         chunk=processed_actions,
                         server_latency_s=server_latency,
+                        server_queue_s=server_queue,
                     )
                 )
 

@@ -184,6 +184,9 @@ class TestSharedNumpyCodec:
         with pytest.raises(ValueError, match="numeric or bool"):
             decode_shared_payload(tagged)
 
+        with pytest.raises(ValueError, match="numeric or bool"):
+            encode_numpy(np.asarray(["not numeric"]))
+
     def test_rejects_shape_dtype_data_length_mismatch(self) -> None:
         tagged = {"__np__": True, "dtype": "float32", "shape": [2], "data": b"1234"}
 

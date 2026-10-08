@@ -24,6 +24,8 @@ def _ensure_contiguous(array: np.ndarray) -> np.ndarray:
 
 def encode_numpy(array: np.ndarray) -> dict[str, Any]:
     """Encode a NumPy array using the shared ``__np__`` MessagePack shape."""
+    if array.dtype.kind not in "biufc":
+        raise ValueError("NumPy array dtype must be numeric or bool")
     contiguous = _ensure_contiguous(array)
     return {
         "__np__": True,
