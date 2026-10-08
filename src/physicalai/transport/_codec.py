@@ -12,11 +12,19 @@ import msgpack
 import numpy as np
 
 DEFAULT_MAX_PAYLOAD_BYTES = 32 * 2**20
+DEFAULT_MAX_PAYLOAD_DEPTH = 64
+
+
+def _ensure_contiguous(array: np.ndarray) -> np.ndarray:
+    """Make non-scalar arrays contiguous without changing scalar shape."""
+    if array.ndim == 0:
+        return array
+    return np.ascontiguousarray(array)
 
 
 def encode_numpy(array: np.ndarray) -> dict[str, Any]:
     """Encode a NumPy array using the shared ``__np__`` MessagePack shape."""
-    contiguous = np.ascontiguousarray(array)
+    contiguous = _ensure_contiguous(array)
     return {
         "__np__": True,
         "dtype": str(contiguous.dtype),
@@ -42,8 +50,17 @@ def pack_msgpack(payload: object) -> bytes:
     return msgpack.packb(payload, default=msgpack_default, use_bin_type=True)
 
 
-def _decode_value(value: object, *, max_bytes: int, array_bytes: list[int]) -> object:
+def _decode_value(
+    value: object,
+    *,
+    max_bytes: int,
+    array_bytes: list[int],
+    depth: int,
+    max_depth: int,
+) -> object:
     if isinstance(value, dict):
+        if depth > max_depth:
+            raise ValueError(f"MessagePack payload nesting exceeds the {max_depth}-level limit")
         if value.get("__np__") is True:
             dtype_value = value.get("dtype")
             shape_value = value.get("shape")
@@ -65,20 +82,52 @@ def _decode_value(value: object, *, max_bytes: int, array_bytes: list[int]) -> o
                 raise ValueError(f"Decoded NumPy arrays exceed the {max_bytes}-byte limit")
             array_bytes[0] += expected_size
             return np.frombuffer(data, dtype=dtype).reshape(tuple(shape_value))
-        return {key: _decode_value(item, max_bytes=max_bytes, array_bytes=array_bytes) for key, item in value.items()}
+        return {
+            key: _decode_value(
+                item,
+                max_bytes=max_bytes,
+                array_bytes=array_bytes,
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
+            for key, item in value.items()
+        }
     if isinstance(value, list):
-        return [_decode_value(item, max_bytes=max_bytes, array_bytes=array_bytes) for item in value]
+        if depth > max_depth:
+            raise ValueError(f"MessagePack payload nesting exceeds the {max_depth}-level limit")
+        return [
+            _decode_value(
+                item,
+                max_bytes=max_bytes,
+                array_bytes=array_bytes,
+                depth=depth + 1,
+                max_depth=max_depth,
+            )
+            for item in value
+        ]
     return value
 
 
-def decode_payload(value: object, *, max_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -> object:
+def decode_payload(
+    value: object,
+    *,
+    max_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+    max_depth: int = DEFAULT_MAX_PAYLOAD_DEPTH,
+) -> object:
     """Recursively decode tagged arrays with dtype, shape, and aggregate-size validation."""
     if not isinstance(max_bytes, int) or isinstance(max_bytes, bool) or max_bytes < 0:
         raise ValueError("max_bytes must be a non-negative integer")
-    return _decode_value(value, max_bytes=max_bytes, array_bytes=[0])
+    if not isinstance(max_depth, int) or isinstance(max_depth, bool) or max_depth < 0:
+        raise ValueError("max_depth must be a non-negative integer")
+    return _decode_value(value, max_bytes=max_bytes, array_bytes=[0], depth=0, max_depth=max_depth)
 
 
-def unpack_msgpack(data: bytes, *, max_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -> object:
+def unpack_msgpack(
+    data: bytes,
+    *,
+    max_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES,
+    max_depth: int = DEFAULT_MAX_PAYLOAD_DEPTH,
+) -> object:
     """Unpack and safely decode a MessagePack payload before NumPy allocation."""
     if len(data) > max_bytes:
         raise ValueError(f"MessagePack payload of {len(data)} bytes exceeds the {max_bytes}-byte limit")
@@ -86,4 +135,4 @@ def unpack_msgpack(data: bytes, *, max_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -
         unpacked = msgpack.unpackb(data, raw=False, strict_map_key=False)
     except (msgpack.UnpackException, TypeError, ValueError, OverflowError) as error:
         raise ValueError("Invalid MessagePack payload") from error
-    return decode_payload(unpacked, max_bytes=max_bytes)
+    return decode_payload(unpacked, max_bytes=max_bytes, max_depth=max_depth)

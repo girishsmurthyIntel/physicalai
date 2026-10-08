@@ -131,6 +131,16 @@ class TestMetadataRoundtrip:
 
         unpackb.assert_not_called()
 
+    def test_deeply_nested_payload_rejected(self) -> None:
+        import msgpack
+
+        payload: dict[str, object] = {"leaf": 1}
+        for _ in range(100):
+            payload = {"k": payload}
+
+        with pytest.raises(ValueError, match="nesting exceeds"):
+            decode_metadata(msgpack.packb(payload, use_bin_type=True))
+
 
 class TestSharedNumpyCodec:
     def test_uses_existing_tagged_numpy_map(self) -> None:
@@ -146,6 +156,15 @@ class TestSharedNumpyCodec:
         encoded = pack_msgpack({"array": array})
         decoded = unpack_msgpack(encoded)
         np.testing.assert_array_equal(decoded["array"], array)
+
+    def test_scalar_array_shape_roundtrips_as_zero_dimensional(self) -> None:
+        scalar = np.asarray(3.5, dtype=np.float32)
+
+        decoded = unpack_msgpack(pack_msgpack({"scalar": scalar}))
+
+        assert decoded["scalar"].shape == ()
+        assert decoded["scalar"].dtype == np.float32
+        assert decoded["scalar"].item() == pytest.approx(3.5)
 
     def test_rejects_non_numeric_dtype(self) -> None:
         tagged = {"__np__": True, "dtype": "|O", "shape": [1], "data": b"x"}
@@ -168,3 +187,11 @@ class TestSharedNumpyCodec:
             decode_shared_payload(tagged, max_bytes=4)
 
         frombuffer.assert_not_called()
+
+    def test_nesting_depth_is_bounded(self) -> None:
+        nested: object = "value"
+        for _ in range(4):
+            nested = {"child": nested}
+
+        with pytest.raises(ValueError, match="nesting exceeds the 2-level limit"):
+            decode_shared_payload(nested, max_depth=2)
