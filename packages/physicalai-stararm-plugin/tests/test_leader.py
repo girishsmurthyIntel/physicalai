@@ -4,7 +4,7 @@ import sys
 from importlib import import_module
 from importlib.machinery import ModuleSpec
 from typing import TYPE_CHECKING, Any, cast
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, call
 
 import numpy as np
 import pytest
@@ -35,22 +35,23 @@ def _make_mock_smart_servo() -> MagicMock:
 
     servo_angles = [0.0, 10.0, -10.0, 30.0, 40.0, 50.0, 60.0]
 
-    def read_angle_side_effect(servo_id: int, *, multi_turn: bool = True) -> MagicMock:
-        _ = multi_turn
-        sample = MagicMock()
-        sample.raw_deg = cast("_ServoFactoryFn", _make_mock_smart_servo).servo_angles[servo_id]
-        sample.filtered_deg = cast("_ServoFactoryFn", _make_mock_smart_servo).servo_angles[servo_id]
-        sample.reliable = True
-        return sample
+    def sync_monitor_side_effect(servo_ids: list[int]) -> dict[int, MagicMock]:
+        monitors = {}
+        for servo_id in servo_ids:
+            monitor = MagicMock()
+            monitor.angle_deg = cast("_ServoFactoryFn", _make_mock_smart_servo).servo_angles[servo_id]
+            monitor.reliable = True
+            monitors[servo_id] = monitor
+        return monitors
 
     cast("_ServoFactoryFn", _make_mock_smart_servo).servo_angles = servo_angles
 
-    bus.read_angle.side_effect = read_angle_side_effect
+    bus.sync_monitor.side_effect = sync_monitor_side_effect
     return module
 
 
 @pytest.fixture
-def mock_smart_servo() -> Generator[MagicMock]:
+def mock_smart_servo(monkeypatch: pytest.MonkeyPatch) -> Generator[MagicMock]:
     module = _make_mock_smart_servo()
     sys.modules.pop("physicalai_stararm_plugin.stararm102hd", None)
     sys.modules.pop("physicalai_stararm_plugin.stararm102ld", None)
@@ -60,10 +61,15 @@ def mock_smart_servo() -> Generator[MagicMock]:
         del cast("_StararmPackageModule", pkg).stararm102hd
     if pkg is not None and hasattr(pkg, "stararm102ld"):
         del cast("_StararmPackageModule", pkg).stararm102ld
-    with patch.dict(sys.modules, {"motorbridge_smart_servo": module}):
-        import_module("physicalai_stararm_plugin.stararm102hd")
-        import_module("physicalai_stararm_plugin.stararm102ld")
-        yield module
+    # setitem restores only this key; patch.dict(sys.modules) would also drop
+    # every module imported during the test (e.g. loguru, multiprocessing).
+    monkeypatch.setitem(sys.modules, "motorbridge_smart_servo", module)
+    import_module("physicalai_stararm_plugin.stararm102hd")
+    import_module("physicalai_stararm_plugin.stararm102ld")
+    yield module
+    sys.modules.pop("physicalai_stararm_plugin.stararm102hd", None)
+    sys.modules.pop("physicalai_stararm_plugin.stararm102ld", None)
+    sys.modules.pop("physicalai_stararm_plugin", None)
 
 
 def _create_robot(mock_smart_servo: MagicMock, **kwargs: Any) -> Any:
@@ -164,6 +170,73 @@ class TestStarArm102HDLeaderObservation:
         assert obs.sensor_data is not None
         assert "raw_positions" in obs.sensor_data
         assert "reliable" in obs.sensor_data
+
+    def test_observation_reads_all_servos_in_one_sync_command(self, mock_smart_servo: MagicMock) -> None:
+        robot = _create_robot(mock_smart_servo)
+        robot.connect()
+        robot.get_observation()
+
+        mock_smart_servo.FashionStarServo.return_value.sync_monitor.assert_called_once_with([0, 1, 2, 3, 4, 5, 6])
+
+    def test_observation_holds_glitch_then_accepts_persistent_jump(self, mock_smart_servo: MagicMock) -> None:
+        robot = _create_robot(mock_smart_servo)
+        robot.connect()
+        angles = cast("_ServoFactoryFn", _make_mock_smart_servo).servo_angles
+        robot.get_observation()
+
+        angles[0] = 120.0  # shoulder_pan jumps 120 deg in one sample, past the 90 deg glitch threshold
+        held = [robot.get_observation() for _ in range(3)]
+        assert all(obs.joint_positions[0] == pytest.approx(0.0) for obs in held)
+        assert all(obs.sensor_data["reliable"][0] == 0.0 for obs in held)
+
+        assert robot.get_observation().joint_positions[0] == pytest.approx(120.0)
+
+    def test_disable_torque_unlocks_every_servo(self, mock_smart_servo: MagicMock) -> None:
+        robot = _create_robot(mock_smart_servo, unlock_on_connect=False)
+        robot.connect()
+        bus = mock_smart_servo.FashionStarServo.return_value
+        bus.unlock.assert_not_called()
+
+        robot.disable_torque()
+
+        assert bus.unlock.call_args_list == [call(i) for i in range(7)]
+        assert robot.is_holding is False
+
+    def test_set_zero_position_sets_origin_and_resets_baseline(self, mock_smart_servo: MagicMock) -> None:
+        robot = _create_robot(mock_smart_servo)
+        robot.connect()
+        robot.get_observation()
+        bus = mock_smart_servo.FashionStarServo.return_value
+        bus.reset_mock()
+
+        robot.set_zero_position()
+
+        assert bus.set_origin_point.call_args_list == [call(i) for i in range(7)]
+        assert bus.reset_multi_turn.call_args_list == [call(i) for i in range(7)]
+        # The origin moved, so the next reading must not be held back as a glitch.
+        cast("_ServoFactoryFn", _make_mock_smart_servo).servo_angles[0] = 120.0
+        assert robot.get_observation().joint_positions[0] == pytest.approx(120.0)
+
+    def test_reconnect_starts_new_glitch_baseline(self, mock_smart_servo: MagicMock) -> None:
+        robot = _create_robot(mock_smart_servo)
+        robot.connect()
+        robot.get_observation()
+        robot.disconnect()
+
+        cast("_ServoFactoryFn", _make_mock_smart_servo).servo_angles[0] = 120.0  # moved while disconnected
+        robot.connect()
+        obs = robot.get_observation()
+
+        assert obs.joint_positions[0] == pytest.approx(120.0)
+        assert obs.sensor_data["reliable"][0] == 1.0
+
+    def test_observation_never_responded_servo_raises(self, mock_smart_servo: MagicMock) -> None:
+        robot = _create_robot(mock_smart_servo)
+        robot.connect()
+        mock_smart_servo.FashionStarServo.return_value.sync_monitor.side_effect = lambda ids: dict.fromkeys(ids)
+
+        with pytest.raises(ConnectionError, match="never responded"):
+            robot.get_observation()
 
     def test_send_action_is_noop_in_passive_mode(self, mock_smart_servo: MagicMock) -> None:
         robot = _create_robot(mock_smart_servo)

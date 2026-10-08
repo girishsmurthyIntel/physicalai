@@ -94,7 +94,7 @@ jobs:
       - *set-up-python
 
       - name: Install uv
-        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
         with:
           version: "0.8.8"
 
@@ -110,7 +110,25 @@ jobs:
           uv pip install --python .venv/bin/python lerobot pytest-anyio
           uv pip install --python .venv/bin/python --no-deps -e packages/physicalai-lerobot-plugin
 
+      # The MuJoCo plugin downloads its robot models from MuJoCo Menagerie. The
+      # plugin pins the mujoco-menagerie version, which fixes every model file,
+      # so its pyproject keys the cache.
+      - name: Restore MuJoCo Menagerie cache
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.temp }}/menagerie-cache
+          key: menagerie-${{ runner.os }}-${{ hashFiles('packages/physicalai-mujoco-plugin/pyproject.toml') }}
+          restore-keys: |
+            menagerie-${{ runner.os }}-
+
+      - name: Fetch MuJoCo Menagerie models
+        env:
+          MENAGERIE_CACHE_DIR: ${{ runner.temp }}/menagerie-cache
+        run: uv run physicalai-mujoco prefetch
+
       - name: Run python unit tests
+        env:
+          MENAGERIE_CACHE_DIR: ${{ runner.temp }}/menagerie-cache
         run: uv run pytest --import-mode=importlib tests/unit packages/*/tests
 
   required-check:

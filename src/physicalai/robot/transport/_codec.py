@@ -42,10 +42,17 @@ The richest realistic record (bimanual state: 14-dim ``joint_positions`` +
 KB. 1 MiB leaves generous headroom for future growth while still rejecting
 a corrupted or hostile payload before any unpacking work is spent on it.
 """
+_MAX_PAYLOAD_DEPTH = 32
+"""Nesting depth limit for :func:`_decode_payload`'s recursive walk.
+"""
 
 
 def _decode_payload(value: object) -> object:
-    return _decode_numpy_payload(value, max_bytes=_MAX_PAYLOAD_BYTES)
+    return _decode_numpy_payload(
+        value,
+        max_bytes=_MAX_PAYLOAD_BYTES,
+        max_depth=_MAX_PAYLOAD_DEPTH,
+    )
 
 
 def _pack_payload(payload: dict[str, Any]) -> bytes:
@@ -54,7 +61,7 @@ def _pack_payload(payload: dict[str, Any]) -> bytes:
 
 def _unpack_payload(data: bytes) -> dict[str, Any]:
     try:
-        payload = unpack_msgpack(data, max_bytes=_MAX_PAYLOAD_BYTES)
+        payload = unpack_msgpack(data, max_bytes=_MAX_PAYLOAD_BYTES, max_depth=_MAX_PAYLOAD_DEPTH)
     except ValueError as error:
         if "exceeds the" in str(error):
             raise ValueError(f"Robot transport payload {error}") from error
@@ -113,11 +120,11 @@ def encode_state(
         msgpack-encoded bytes.
     """
     payload: dict[str, Any] = {
-        "joint_positions": _encode_numpy(np.ascontiguousarray(joint_positions)),
-        "state": _encode_numpy(np.ascontiguousarray(state)),
+        "joint_positions": _encode_numpy(joint_positions),
+        "state": _encode_numpy(state),
         "timestamp": timestamp,
         "sensor_data": (
-            {k: _encode_numpy(np.ascontiguousarray(v)) for k, v in sensor_data.items()}
+            {k: _encode_numpy(v) for k, v in sensor_data.items()}
             if sensor_data is not None
             else None
         ),
@@ -158,7 +165,7 @@ def encode_action(action: np.ndarray, goal_time: float) -> bytes:
         msgpack-encoded bytes.
     """
     payload: dict[str, Any] = {
-        "action": _encode_numpy(np.ascontiguousarray(action)),
+        "action": _encode_numpy(action),
         "goal_time": goal_time,
         "ts": time.monotonic(),
     }

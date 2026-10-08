@@ -109,8 +109,11 @@ REBOT_B601_RS_MOTOR_MODELS: Final = {
     "gripper": "rs-00",
 }
 
+# Peak torque (N·m) of the RobStride RS-00 driving the gripper, from its MIT-mode torque range.
+REBOT_B601_RS_GRIPPER_MAX_TORQUE_NM: Final = 14.0
+
 REBOT_B601_RS_JOINT_LIMITS_DEG: Final = {
-    "shoulder_pan": (-0.0, 145.0),
+    "shoulder_pan": (-145.0, 145.0),
     "shoulder_lift": (-0.0, 170.0),
     "elbow_flex": (-0.0, 200.0),
     "wrist_flex": (-80.0, 90.0),
