@@ -10,7 +10,7 @@ import errno
 import pytest
 
 from physicalai.cli import inference
-from physicalai.transport._zenoh import derive_endpoint_port
+from physicalai.transport._zenoh import derive_port
 
 
 def test_port_prints_model_derived_port(capsys) -> None:  # noqa: ANN001
@@ -18,7 +18,19 @@ def test_port_prints_model_derived_port(capsys) -> None:  # noqa: ANN001
     cfg = parser.parse_args(["port", "pi05"])
 
     assert inference._dispatch(parser, cfg) == 0  # noqa: SLF001
-    assert capsys.readouterr().out.strip() == str(derive_endpoint_port("physicalai/inference/pi05"))
+    assert capsys.readouterr().out.strip() == str(derive_port("inference", "pi05"))
+
+
+@pytest.mark.parametrize(
+    ("name", "expected_port"),
+    [("so101-act", 31339), ("cell1-act", 20212), ("cell2-pi05", 37278)],
+)
+def test_port_matches_reference_values(name: str, expected_port: int, capsys) -> None:  # noqa: ANN001
+    parser = inference.build_parser()
+    cfg = parser.parse_args(["port", name])
+
+    assert inference._dispatch(parser, cfg) == 0  # noqa: SLF001
+    assert capsys.readouterr().out.strip() == str(expected_port)
 
 
 def test_serve_parser_accepts_required_name_and_export_source() -> None:

@@ -16,7 +16,7 @@ from __future__ import annotations
 import re
 import socket
 
-from physicalai.transport._zenoh import derive_endpoint_port as _derive_endpoint_port
+from physicalai.transport._zenoh import derive_port
 
 KEY_PREFIX = "physicalai/robot"
 
@@ -101,7 +101,7 @@ def derive_endpoint_port(name: str) -> int:
     Returns:
         A port in ``[20000, 59999]``.
     """
-    return _derive_endpoint_port(robot_prefix(name))
+    return derive_port("robot", validate_name(name))
 
 
 def default_host() -> str:

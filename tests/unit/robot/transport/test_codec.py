@@ -18,6 +18,8 @@ from physicalai.robot.transport._codec import (
     encode_metadata,
     encode_state,
 )
+from physicalai.transport._codec import decode_payload as decode_shared_payload
+from physicalai.transport._codec import encode_numpy, pack_msgpack, unpack_msgpack
 
 
 class TestStateRoundtrip:
@@ -128,3 +130,41 @@ class TestMetadataRoundtrip:
             decode_metadata(oversized)
 
         unpackb.assert_not_called()
+
+
+class TestSharedNumpyCodec:
+    def test_uses_existing_tagged_numpy_map(self) -> None:
+        array = np.arange(6, dtype=np.float32).reshape(2, 3)
+
+        assert encode_numpy(array) == {
+            "__np__": True,
+            "dtype": "float32",
+            "shape": [2, 3],
+            "data": array.tobytes(),
+        }
+
+        encoded = pack_msgpack({"array": array})
+        decoded = unpack_msgpack(encoded)
+        np.testing.assert_array_equal(decoded["array"], array)
+
+    def test_rejects_non_numeric_dtype(self) -> None:
+        tagged = {"__np__": True, "dtype": "|O", "shape": [1], "data": b"x"}
+
+        with pytest.raises(ValueError, match="numeric or bool"):
+            decode_shared_payload(tagged)
+
+    def test_rejects_shape_dtype_data_length_mismatch(self) -> None:
+        tagged = {"__np__": True, "dtype": "float32", "shape": [2], "data": b"1234"}
+
+        with pytest.raises(ValueError, match="data length"):
+            decode_shared_payload(tagged)
+
+    def test_size_cap_is_checked_before_frombuffer(self) -> None:
+        tagged = {"__np__": True, "dtype": "float32", "shape": [2], "data": b"12345678"}
+        with (
+            patch("physicalai.transport._codec.np.frombuffer") as frombuffer,
+            pytest.raises(ValueError, match="limit"),
+        ):
+            decode_shared_payload(tagged, max_bytes=4)
+
+        frombuffer.assert_not_called()

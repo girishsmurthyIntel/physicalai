@@ -18,6 +18,10 @@ from typing import Any
 
 import numpy as np
 
+from physicalai.transport._codec import decode_payload as _decode_numpy_payload
+from physicalai.transport._codec import encode_numpy as _encode_numpy
+from physicalai.transport._codec import pack_msgpack, unpack_msgpack
+
 ROBOT_TRANSPORT_PROTOCOL_VERSION = 1
 """Version of the robot transport wire contract (not the robot class or
 package release). Subscribers reject an owner advertising an unsupported
@@ -40,50 +44,21 @@ a corrupted or hostile payload before any unpacking work is spent on it.
 """
 
 
-def _encode_numpy(array: np.ndarray) -> dict[str, Any]:
-    return {
-        "__np__": True,
-        "dtype": str(array.dtype),
-        "shape": list(array.shape),
-        "data": array.tobytes(),
-    }
-
-
 def _decode_payload(value: object) -> object:
-    if isinstance(value, dict):
-        if value.get("__np__"):
-            return np.frombuffer(value["data"], dtype=np.dtype(value["dtype"])).reshape(value["shape"])
-        return {key: _decode_payload(item) for key, item in value.items()}
-    if isinstance(value, list):
-        return [_decode_payload(item) for item in value]
-    return value
-
-
-def _msgpack_default(value: object) -> object:
-    if isinstance(value, np.ndarray):
-        return _encode_numpy(value)
-    if isinstance(value, np.integer):
-        return int(value)
-    if isinstance(value, np.floating):
-        return float(value)
-    msg = f"Unsupported robot transport type for msgpack serialization: {type(value).__name__}"
-    raise TypeError(msg)
+    return _decode_numpy_payload(value, max_bytes=_MAX_PAYLOAD_BYTES)
 
 
 def _pack_payload(payload: dict[str, Any]) -> bytes:
-    import msgpack  # noqa: PLC0415
-
-    return msgpack.packb(payload, default=_msgpack_default, use_bin_type=True)  # type: ignore[return-value]
+    return pack_msgpack(payload)
 
 
 def _unpack_payload(data: bytes) -> dict[str, Any]:
-    import msgpack  # noqa: PLC0415
-
-    if len(data) > _MAX_PAYLOAD_BYTES:
-        msg = f"Robot transport payload of {len(data)} bytes exceeds the {_MAX_PAYLOAD_BYTES}-byte limit"
-        raise ValueError(msg)
-
-    payload = _decode_payload(msgpack.unpackb(data, raw=False))
+    try:
+        payload = unpack_msgpack(data, max_bytes=_MAX_PAYLOAD_BYTES)
+    except ValueError as error:
+        if "exceeds the" in str(error):
+            raise ValueError(f"Robot transport payload {error}") from error
+        raise
     if not isinstance(payload, dict):
         msg = f"Expected a dict payload, got {type(payload).__name__}"
         raise TypeError(msg)

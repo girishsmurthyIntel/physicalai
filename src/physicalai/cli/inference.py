@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from jsonargparse import ArgumentParser
 
 from physicalai.cli._spec import SubcommandSpec  # noqa: PLC2701
-from physicalai.transport._zenoh import endpoint_for_key, model_key_prefix
+from physicalai.transport._zenoh import derive_port, endpoint_for_key, model_key_prefix
 
 if TYPE_CHECKING:
     from jsonargparse import Namespace
@@ -152,9 +152,8 @@ def _serve(cfg: Namespace) -> int:
 
 
 def _port(cfg: Namespace) -> int:
-    key_prefix = model_key_prefix(cfg.name)
-    endpoint = endpoint_for_key(key_prefix, "127.0.0.1")
-    print(endpoint.rsplit(":", maxsplit=1)[-1])  # noqa: T201
+    model_key_prefix(cfg.name)
+    print(derive_port("inference", cfg.name))  # noqa: T201
     return 0
 
 

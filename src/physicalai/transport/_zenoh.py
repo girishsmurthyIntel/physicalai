@@ -16,7 +16,7 @@ if TYPE_CHECKING:
 
 _PORT_BASE = 20000
 _PORT_RANGE = 40000
-_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}\Z", re.ASCII)
+_MODEL_NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]*\Z", re.ASCII)
 
 
 def model_key_prefix(model_name: str) -> str:
@@ -26,8 +26,18 @@ def model_key_prefix(model_name: str) -> str:
     return f"physicalai/inference/{model_name}"
 
 
+def derive_port(namespace: str, name: str) -> int:
+    """Derive a stable unprivileged TCP port for one named namespace."""
+    key_prefix = f"physicalai/{namespace}/{name}"
+    digest = hashlib.sha256(key_prefix.encode("utf-8")).digest()
+    return _PORT_BASE + int.from_bytes(digest[:4], "big") % _PORT_RANGE
+
+
 def derive_endpoint_port(key_prefix: str) -> int:
-    """Derive a stable unprivileged TCP port from a Zenoh key namespace."""
+    """Compatibility helper deriving a port from a full ``physicalai`` key prefix."""
+    parts = key_prefix.split("/", maxsplit=2)
+    if len(parts) == 3 and parts[0] == "physicalai":
+        return derive_port(parts[1], parts[2])
     digest = hashlib.sha256(key_prefix.encode("utf-8")).digest()
     return _PORT_BASE + int.from_bytes(digest[:4], "big") % _PORT_RANGE
 

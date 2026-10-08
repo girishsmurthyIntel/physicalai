@@ -1,7 +1,7 @@
 # Copyright (C) 2026 Intel Corporation
 # SPDX-License-Identifier: Apache-2.0
 
-"""MessagePack and JPEG wire protocol for remote inference."""
+"""Version-one MessagePack protocol and RGB image codecs for remote inference."""
 
 from __future__ import annotations
 
@@ -15,10 +15,11 @@ import msgpack
 import numpy as np
 
 from physicalai.inference.constants import IMAGES
+from physicalai.transport._codec import DEFAULT_MAX_PAYLOAD_BYTES, pack_msgpack, unpack_msgpack
 
 PROTOCOL_VERSION = 1
 DEFAULT_IMAGE_JPEG_QUALITY = 90
-DEFAULT_MAX_REQUEST_BYTES = 32 * 2**20
+DEFAULT_MAX_REQUEST_BYTES = DEFAULT_MAX_PAYLOAD_BYTES
 ImageCodec = Literal["jpeg", "raw"]
 
 
@@ -46,370 +47,335 @@ class RemoteInferenceModelMismatchError(RemoteInferenceError):
 class RemoteTiming:
     """Timing information for the last completed remote request."""
 
-    seq: int
     round_trip_s: float
-    queue_s: float
-    compute_s: float
+    server_queue_s: float
+    server_compute_s: float
+    encode_s: float
+    decode_s: float
+    request_bytes: int
+    reply_bytes: int
 
 
-def encode_payload(metadata: dict[str, Any], frames: list[bytes]) -> bytes:
-    """Pack metadata and binary frames into a MessagePack envelope."""
-    return msgpack.packb({"metadata": metadata, "frames": frames}, use_bin_type=True)
-
-
-def decode_payload(payload: bytes) -> tuple[dict[str, Any], list[bytes]]:
-    """Unpack and validate a MessagePack envelope."""
+def encode_message(message: dict[str, Any]) -> bytes:
+    """Encode one protocol map using the shared tagged-array MessagePack codec."""
+    if not isinstance(message, dict):
+        raise TypeError("Protocol messages must be maps")
     try:
-        unpacked = msgpack.unpackb(payload, raw=False, strict_map_key=False)
+        return pack_msgpack(message)
+    except (TypeError, ValueError, OverflowError) as error:
+        raise RemoteInferenceProtocolError(f"Could not encode protocol message: {error}") from error
+
+
+def decode_message(payload: bytes, *, max_bytes: int = DEFAULT_MAX_REQUEST_BYTES) -> dict[str, Any]:
+    """Decode a protocol map, validating every tagged ndarray before allocation."""
+    try:
+        message = unpack_msgpack(payload, max_bytes=max_bytes)
     except (msgpack.UnpackException, TypeError, ValueError, OverflowError) as error:
-        raise RemoteInferenceProtocolError("Invalid MessagePack inference payload") from error
-    if not isinstance(unpacked, dict):
-        raise RemoteInferenceProtocolError("Payload must be a MessagePack map")
-    metadata = unpacked.get("metadata")
-    frames = unpacked.get("frames")
-    if not isinstance(metadata, dict) or not isinstance(frames, list):
-        raise RemoteInferenceProtocolError("Payload must contain metadata and frames")
-    if not all(isinstance(frame, bytes) for frame in frames):
-        raise RemoteInferenceProtocolError("Payload frames must be binary data")
-    return metadata, frames
+        raise RemoteInferenceProtocolError(f"Invalid MessagePack protocol map: {error}") from error
+    if not isinstance(message, dict) or any(not isinstance(key, str) for key in message):
+        raise RemoteInferenceProtocolError("Protocol message must be a string-keyed MessagePack map")
+    return message
 
 
 def decode_error(payload: bytes) -> dict[str, Any]:
-    """Decode the protocol's compact query.reply_err map."""
-    try:
-        value = msgpack.unpackb(payload, raw=False, strict_map_key=False)
-    except (msgpack.UnpackException, TypeError, ValueError, OverflowError) as error:
-        raise RemoteInferenceProtocolError("Invalid remote error reply") from error
-    if not isinstance(value, dict):
-        raise RemoteInferenceProtocolError("Remote error reply must be a MessagePack map")
-    return value
-
-
-def array_descriptor(name: str, array: np.ndarray, encoding: str = "raw") -> dict[str, Any]:
-    """Describe a binary array frame."""
-    return {"name": name, "dtype": array.dtype.str, "shape": list(array.shape), "encoding": encoding}
+    """Decode the protocol's compact ``query.reply_err`` map."""
+    message = decode_message(payload)
+    version = message.get("protocol_version")
+    if isinstance(version, bool) or not isinstance(version, int) or not isinstance(message.get("code"), str):
+        raise RemoteInferenceProtocolError("Malformed remote error map")
+    return message
 
 
 def _is_image_input(name: str) -> bool:
     return name == IMAGES or name.startswith(f"{IMAGES}.")
 
 
-def _scaled_image(image: np.ndarray, max_side: int | None) -> np.ndarray:
+def _resize_image(image: np.ndarray, max_image_side: int | None) -> np.ndarray:
     if image.dtype != np.uint8 or image.ndim not in (3, 4) or image.shape[-1] != 3:
-        raise RemoteInferenceProtocolError("Image inputs must be uint8 with a trailing channel dimension of 3")
+        raise RemoteInferenceProtocolError("Images must be uint8 HxWx3 or BxHxWx3 arrays")
     height, width = image.shape[-3:-1]
-    if max_side is None or max(height, width) <= max_side:
-        return image
-    scale = max_side / max(height, width)
+    if height < 1 or width < 1 or (image.ndim == 4 and image.shape[0] < 1):
+        raise RemoteInferenceProtocolError("Image dimensions must be positive")
+    if max_image_side is None or max(height, width) <= max_image_side:
+        return np.ascontiguousarray(image)
+    scale = max_image_side / max(height, width)
     new_size = (max(1, round(width * scale)), max(1, round(height * scale)))
     if image.ndim == 3:
         return cv2.resize(image, new_size, interpolation=cv2.INTER_AREA)
-    return np.stack([cv2.resize(item, new_size, interpolation=cv2.INTER_AREA) for item in image])
+    return np.stack([cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA) for frame in image])
 
 
-def _encode_jpeg(image: np.ndarray, quality: int) -> bytes:
-    if image.ndim == 4:
-        if image.shape[0] != 1:
-            raise RemoteInferenceProtocolError("JPEG image batch dimension must be one")
-        image = image[0]
-    rgb = image[..., ::-1]
-    success, encoded = cv2.imencode(".jpg", rgb, [cv2.IMWRITE_JPEG_QUALITY, quality])
-    if not success:
-        raise RemoteInferenceProtocolError("Image encoder failed")
-    return encoded.tobytes()
+def encode_images(
+    images: dict[str, Any],
+    *,
+    image_codec: ImageCodec,
+    jpeg_quality: int,
+    max_image_side: int | None,
+) -> dict[str, dict[str, Any]]:
+    """Encode each named RGB image at native resolution unless downscaling is requested."""
+    if image_codec not in ("jpeg", "raw"):
+        raise ValueError("image_codec must be 'jpeg' or 'raw'")
+    if not isinstance(jpeg_quality, int) or isinstance(jpeg_quality, bool) or not 0 <= jpeg_quality <= 100:
+        raise ValueError("jpeg_quality must be between 0 and 100")
+    if max_image_side is not None and (
+        not isinstance(max_image_side, int) or isinstance(max_image_side, bool) or max_image_side < 1
+    ):
+        raise ValueError("max_image_side must be positive")
+    encoded: dict[str, dict[str, Any]] = {}
+    for name, value in images.items():
+        if not isinstance(name, str):
+            raise RemoteInferenceProtocolError("Image keys must be strings")
+        image = _resize_image(np.asarray(value), max_image_side)
+        data = image.tobytes()
+        if image_codec == "jpeg":
+            if image.ndim == 4:
+                if image.shape[0] != 1:
+                    raise RemoteInferenceProtocolError("JPEG supports a leading batch dimension of one")
+                frame = image[0]
+            else:
+                frame = image
+            # Model-facing pixels are RGB; convert to and from OpenCV's BGR convention symmetrically.
+            success, jpeg = cv2.imencode(
+                ".jpg",
+                np.ascontiguousarray(frame[..., ::-1]),
+                [cv2.IMWRITE_JPEG_QUALITY, jpeg_quality],
+            )
+            if not success:
+                raise RemoteInferenceProtocolError("OpenCV failed to encode JPEG image")
+            data = jpeg.tobytes()
+        encoded[name] = {
+            "codec": image_codec,
+            "shape": list(image.shape),
+            "dtype": "uint8",
+            "data": data,
+        }
+    return encoded
 
 
-def encode_request(
+def _jpeg_dimensions(data: bytes) -> tuple[int, int]:
+    if len(data) < 4 or data[:2] != b"\xff\xd8":
+        raise RemoteInferenceProtocolError("Malformed JPEG image data")
+    start_of_frame = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
+    offset = 2
+    while offset + 4 <= len(data):
+        if data[offset] != 0xFF:
+            raise RemoteInferenceProtocolError("Malformed JPEG marker")
+        while offset < len(data) and data[offset] == 0xFF:
+            offset += 1
+        if offset >= len(data):
+            break
+        marker = data[offset]
+        offset += 1
+        if marker in {0xD8, 0xD9, 0x01, *range(0xD0, 0xD8)}:
+            continue
+        if offset + 2 > len(data):
+            break
+        segment_length = struct.unpack_from(">H", data, offset)[0]
+        if segment_length < 2 or offset + segment_length > len(data):
+            raise RemoteInferenceProtocolError("Malformed JPEG segment")
+        if marker in start_of_frame:
+            if segment_length < 7:
+                raise RemoteInferenceProtocolError("Malformed JPEG frame header")
+            height, width = struct.unpack_from(">HH", data, offset + 3)
+            if width < 1 or height < 1:
+                raise RemoteInferenceProtocolError("Invalid JPEG dimensions")
+            return height, width
+        offset += segment_length
+    raise RemoteInferenceProtocolError("JPEG image has no dimensions")
+
+
+def decode_images(
+    images: object,
+    *,
+    max_bytes: int,
+    already_decoded_bytes: int,
+) -> dict[str, np.ndarray]:
+    """Decode image entries after validating shape and total allocation size."""
+    if not isinstance(images, dict) or any(not isinstance(key, str) for key in images):
+        raise RemoteInferenceProtocolError("Request images must be a string-keyed map")
+    decoded: dict[str, np.ndarray] = {}
+    decoded_bytes = already_decoded_bytes
+    for name, entry in images.items():
+        if not _is_image_input(name):
+            raise RemoteInferenceProtocolError(f"Image key {name!r} must use the '{IMAGES}' namespace")
+        if not isinstance(entry, dict):
+            raise RemoteInferenceProtocolError("Image entry must be a map")
+        codec = entry.get("codec")
+        shape_value = entry.get("shape")
+        dtype = entry.get("dtype")
+        data = entry.get("data")
+        if codec not in ("jpeg", "raw") or dtype != "uint8" or not isinstance(data, bytes):
+            raise RemoteInferenceProtocolError("Malformed image codec, dtype, or data")
+        if not isinstance(shape_value, list) or any(
+            not isinstance(dim, int) or isinstance(dim, bool) or dim < 1 for dim in shape_value
+        ):
+            raise RemoteInferenceProtocolError("Image shape dimensions must be positive integers")
+        shape = tuple(shape_value)
+        if len(shape) not in (3, 4) or shape[-1] != 3:
+            raise RemoteInferenceProtocolError("Images must declare HxWx3 or BxHxWx3 shapes")
+        if len(shape) == 4 and shape[0] != 1:
+            raise RemoteInferenceProtocolError("Remote inference image batch dimension must be one")
+        expected_size = math.prod(shape)
+        if expected_size > max_bytes - decoded_bytes:
+            raise RemoteInferenceProtocolError("Decoded image arrays exceed max_request_bytes")
+        if codec == "raw":
+            if len(data) != expected_size:
+                raise RemoteInferenceProtocolError("Raw image data length does not match its shape")
+            image = np.frombuffer(data, dtype=np.uint8).reshape(shape).copy()
+        else:
+            if _jpeg_dimensions(data) != shape[-3:-1]:
+                raise RemoteInferenceProtocolError("JPEG dimensions do not match the declared shape")
+            bgr = cv2.imdecode(np.frombuffer(data, dtype=np.uint8), cv2.IMREAD_COLOR)
+            if bgr is None:
+                raise RemoteInferenceProtocolError("OpenCV failed to decode JPEG image")
+            image = np.ascontiguousarray(bgr[..., ::-1])
+            if len(shape) == 4:
+                image = image[np.newaxis]
+            if image.shape != shape:
+                raise RemoteInferenceProtocolError("Decoded JPEG image does not match its declared shape")
+        decoded_bytes += expected_size
+        decoded[name] = image
+    return decoded
+
+
+def encode_predict_request(
     inputs: dict[str, Any],
     *,
     seq: int,
     budget_ms: int,
-    api: Literal["call", "action_chunk"],
-    image_codec: ImageCodec = "jpeg",
-    jpeg_quality: int = DEFAULT_IMAGE_JPEG_QUALITY,
-    max_image_side: int | None = None,
+    image_codec: ImageCodec,
+    jpeg_quality: int,
+    max_image_side: int | None,
 ) -> bytes:
-    """Encode a predict request with sequence, deadline, and array descriptors."""
-    if image_codec not in ("jpeg", "raw"):
-        raise ValueError("image_codec must be 'jpeg' or 'raw'")
-    if not 0 <= jpeg_quality <= 100:
-        raise ValueError("jpeg_quality must be between 0 and 100")
-    if max_image_side is not None and max_image_side < 1:
-        raise ValueError("max_image_side must be positive")
-    arrays: list[dict[str, Any]] = []
-    frames: list[bytes] = []
+    """Encode the protocol-v1 predict map, keeping string lists in MessagePack."""
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        raise ValueError("seq must be a non-negative integer")
+    if not isinstance(budget_ms, int) or isinstance(budget_ms, bool) or budget_ms < 1:
+        raise ValueError("budget_ms must be a positive integer")
+    model_inputs: dict[str, Any] = {}
+    image_inputs: dict[str, Any] = {}
     for name, value in inputs.items():
-        if isinstance(value, list) and all(isinstance(item, str) for item in value):
-            arrays.append({"name": name, "encoding": "msgpack_strings", "value": value})
-            continue
-        try:
-            array = np.ascontiguousarray(np.asarray(value))
-        except (TypeError, ValueError) as error:
-            raise RemoteInferenceProtocolError(f"Input {name!r} is not a supported array") from error
-        if array.dtype.kind not in "biufc":
-            raise RemoteInferenceProtocolError(f"Input {name!r} must have a numeric or bool dtype")
-        encoding = "raw"
+        if not isinstance(name, str):
+            raise RemoteInferenceProtocolError("Input keys must be strings")
         if _is_image_input(name):
-            array = np.ascontiguousarray(_scaled_image(array, max_image_side))
-            if image_codec == "jpeg":
-                frame = _encode_jpeg(array, jpeg_quality)
-                encoding = "jpeg"
-            else:
-                frame = array.tobytes()
+            image_inputs[name] = value
+        elif isinstance(value, list) and all(isinstance(item, str) for item in value):
+            model_inputs[name] = value
+        elif isinstance(value, np.ndarray) and value.dtype.kind in "biufc":
+            model_inputs[name] = value
+        elif isinstance(value, (bool, int, float, np.number)):
+            scalar = np.asarray(value)
+            if scalar.dtype.kind not in "biufc":
+                raise RemoteInferenceProtocolError(f"Input {name!r} must be numeric or bool")
+            model_inputs[name] = scalar
         else:
-            frame = array.tobytes()
-        arrays.append(array_descriptor(name, array, encoding))
-        frames.append(frame)
-    return encode_payload(
-        {
-            "protocol_version": PROTOCOL_VERSION,
-            "command": "predict",
-            "api": api,
-            "seq": seq,
-            "budget_ms": budget_ms,
-            "arrays": arrays,
-        },
-        frames,
+            raise RemoteInferenceProtocolError(f"Input {name!r} must be a numeric ndarray or list[str]")
+    image_entries = encode_images(
+        image_inputs,
+        image_codec=image_codec,
+        jpeg_quality=jpeg_quality,
+        max_image_side=max_image_side,
     )
+    return encode_message({
+        "protocol_version": PROTOCOL_VERSION,
+        "seq": seq,
+        "budget_ms": budget_ms,
+        "inputs": model_inputs,
+        "images": image_entries,
+    })
 
 
-def _checked_shape_dtype(descriptor: object, *, max_bytes: int) -> tuple[str, np.dtype[Any], tuple[int, ...], int, str]:
-    if not isinstance(descriptor, dict):
-        raise RemoteInferenceProtocolError("Invalid array descriptor")
-    name = descriptor.get("name")
-    shape_value = descriptor.get("shape")
-    encoding = descriptor.get("encoding")
-    if not isinstance(name, str) or not isinstance(shape_value, list) or not isinstance(encoding, str):
-        raise RemoteInferenceProtocolError("Invalid array descriptor")
-    if any(not isinstance(size, int) or isinstance(size, bool) or size < 0 for size in shape_value):
-        raise RemoteInferenceProtocolError("Invalid array shape")
-    try:
-        dtype = np.dtype(descriptor.get("dtype"))
-    except (TypeError, ValueError) as error:
-        raise RemoteInferenceProtocolError("Invalid array dtype") from error
-    if dtype.kind not in "biufc":
-        raise RemoteInferenceProtocolError("Array dtype must be numeric or bool")
-    shape = tuple(shape_value)
-    elements = math.prod(shape)
-    if elements > max_bytes // max(1, dtype.itemsize):
-        raise RemoteInferenceProtocolError("Decoded arrays exceed max_request_bytes")
-    return name, dtype, shape, elements * dtype.itemsize, encoding
-
-
-def _jpeg_dimensions(frame: bytes) -> tuple[int, int]:
-    if len(frame) < 4 or frame[:2] != b"\xff\xd8":
-        raise RemoteInferenceProtocolError("Malformed JPEG image frame")
-    sof_markers = {0xC0, 0xC1, 0xC2, 0xC3, 0xC5, 0xC6, 0xC7, 0xC9, 0xCA, 0xCB, 0xCD, 0xCE, 0xCF}
-    offset = 2
-    while offset + 4 <= len(frame):
-        if frame[offset] != 0xFF:
-            raise RemoteInferenceProtocolError("Malformed JPEG marker")
-        while offset < len(frame) and frame[offset] == 0xFF:
-            offset += 1
-        if offset >= len(frame):
-            break
-        marker = frame[offset]
-        offset += 1
-        if marker in {0xD8, 0xD9, 0x01, *range(0xD0, 0xD8)}:
-            continue
-        if offset + 2 > len(frame):
-            break
-        segment_length = struct.unpack_from(">H", frame, offset)[0]
-        if segment_length < 2 or offset + segment_length > len(frame):
-            raise RemoteInferenceProtocolError("Malformed JPEG segment")
-        if marker in sof_markers:
-            if segment_length < 7:
-                raise RemoteInferenceProtocolError("Malformed JPEG frame header")
-            height, width = struct.unpack_from(">HH", frame, offset + 3)
-            if height == 0 or width == 0:
-                raise RemoteInferenceProtocolError("Invalid JPEG dimensions")
-            return height, width
-        offset += segment_length
-    raise RemoteInferenceProtocolError("JPEG frame has no dimensions")
-
-
-def decode_request(
+def decode_predict_request(
     payload: bytes,
     *,
     max_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
-) -> tuple[dict[str, Any], dict[str, np.ndarray | list[str]]]:
-    """Validate and decode request arrays without allocating beyond max_bytes."""
-    if len(payload) > max_bytes:
-        raise RemoteInferenceProtocolError("Request exceeds max_request_bytes")
-    metadata, frames = decode_payload(payload)
-    if metadata.get("protocol_version") != PROTOCOL_VERSION:
-        raise RemoteInferenceProtocolError("Unsupported request protocol version")
-    if metadata.get("command") != "predict":
-        raise RemoteInferenceProtocolError("Invalid predict command")
-    seq = metadata.get("seq")
-    budget_ms = metadata.get("budget_ms")
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Validate a v1 predict request and reconstruct all arrays/images."""
+    message = decode_message(payload, max_bytes=max_bytes)
+    if set(message) != {"protocol_version", "seq", "budget_ms", "inputs", "images"}:
+        raise RemoteInferenceProtocolError("Predict request has unexpected or missing fields")
+    version = message.get("protocol_version")
+    if not isinstance(version, int) or isinstance(version, bool) or version != PROTOCOL_VERSION:
+        raise RemoteInferenceProtocolError("Unsupported predict protocol version")
+    seq = message.get("seq")
+    budget = message.get("budget_ms")
     if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
-        raise RemoteInferenceProtocolError("Invalid request sequence")
-    if not isinstance(budget_ms, int) or isinstance(budget_ms, bool) or budget_ms < 1:
-        raise RemoteInferenceProtocolError("Invalid request budget")
-    if metadata.get("api") not in ("call", "action_chunk"):
-        raise RemoteInferenceProtocolError("Invalid inference API")
-    descriptors = metadata.get("arrays")
-    if not isinstance(descriptors, list):
-        raise RemoteInferenceProtocolError("Request arrays must be a list")
-    binary_descriptors = [
-        item for item in descriptors if isinstance(item, dict) and item.get("encoding") != "msgpack_strings"
-    ]
-    if len(binary_descriptors) != len(frames):
-        raise RemoteInferenceProtocolError("Request metadata does not match data frames")
-    inputs: dict[str, np.ndarray | list[str]] = {}
-    frame_index = 0
-    total_decoded_bytes = 0
-    seen_names: set[str] = set()
-    for descriptor in descriptors:
-        if not isinstance(descriptor, dict):
-            raise RemoteInferenceProtocolError("Invalid array descriptor")
-        name = descriptor.get("name")
-        if not isinstance(name, str) or not name or name in seen_names:
-            raise RemoteInferenceProtocolError("Invalid or duplicate input name")
-        seen_names.add(name)
-        encoding = descriptor.get("encoding")
-        if encoding == "msgpack_strings":
-            values = descriptor.get("value")
-            if not isinstance(values, list) or not all(isinstance(item, str) for item in values):
-                raise RemoteInferenceProtocolError("String inputs must be MessagePack string arrays")
-            total_decoded_bytes += sum(len(item.encode("utf-8")) for item in values)
-            if total_decoded_bytes > max_bytes:
-                raise RemoteInferenceProtocolError("Decoded arrays exceed max_request_bytes")
-            inputs[name] = values
-            continue
-        name, dtype, shape, decoded_size, encoding = _checked_shape_dtype(descriptor, max_bytes=max_bytes)
-        total_decoded_bytes += decoded_size
-        if total_decoded_bytes > max_bytes:
-            raise RemoteInferenceProtocolError("Decoded arrays exceed max_request_bytes")
-        frame = frames[frame_index]
-        frame_index += 1
-        if encoding == "jpeg":
-            if not _is_image_input(name) or dtype != np.dtype(np.uint8) or len(shape) not in (3, 4) or shape[-1] != 3:
-                raise RemoteInferenceProtocolError("JPEG image descriptor is invalid")
-            if _jpeg_dimensions(frame) != shape[-3:-1]:
-                raise RemoteInferenceProtocolError("JPEG dimensions do not match the declared shape")
-            image = cv2.imdecode(np.frombuffer(frame, dtype=np.uint8), cv2.IMREAD_COLOR)
-            if image is None:
-                raise RemoteInferenceProtocolError("Image decoder rejected the JPEG frame")
-            image = image[..., ::-1]
-            if len(shape) == 4:
-                if shape[0] != 1:
-                    raise RemoteInferenceProtocolError("JPEG batch dimension must be one")
-                image = image[np.newaxis]
-            inputs[name] = np.ascontiguousarray(image)
-        elif encoding == "raw":
-            if _is_image_input(name) and (dtype != np.dtype(np.uint8) or len(shape) not in (3, 4) or shape[-1] != 3):
-                raise RemoteInferenceProtocolError("Image inputs must be uint8 with a trailing channel dimension of 3")
-            if len(frame) != decoded_size:
-                raise RemoteInferenceProtocolError(f"Input {name!r} has invalid data length")
-            inputs[name] = np.frombuffer(frame, dtype=dtype).reshape(shape).copy()
-        else:
-            raise RemoteInferenceProtocolError(f"Unsupported array encoding: {encoding!r}")
-    return metadata, inputs
+        raise RemoteInferenceProtocolError("Invalid prediction sequence")
+    if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
+        raise RemoteInferenceProtocolError("Invalid prediction budget")
+    inputs = message.get("inputs")
+    if not isinstance(inputs, dict) or any(not isinstance(name, str) for name in inputs):
+        raise RemoteInferenceProtocolError("Predict inputs must be a string-keyed map")
+    decoded_bytes = 0
+    for name, value in inputs.items():
+        if _is_image_input(name):
+            raise RemoteInferenceProtocolError("Image inputs must use the separate images map")
+        if isinstance(value, np.ndarray):
+            if value.dtype.kind not in "biufc":
+                raise RemoteInferenceProtocolError("Input array dtype must be numeric or bool")
+            decoded_bytes += value.nbytes
+        elif not (isinstance(value, list) and all(isinstance(item, str) for item in value)):
+            raise RemoteInferenceProtocolError("Predict inputs must contain numeric arrays or list[str]")
+    if decoded_bytes > max_bytes:
+        raise RemoteInferenceProtocolError("Decoded input arrays exceed max_request_bytes")
+    image_inputs = decode_images(message.get("images"), max_bytes=max_bytes, already_decoded_bytes=decoded_bytes)
+    overlap = inputs.keys() & image_inputs.keys()
+    if overlap:
+        raise RemoteInferenceProtocolError(f"Duplicate input and image keys: {sorted(overlap)!r}")
+    inputs.update(image_inputs)
+    return message, inputs
 
 
-def encode_response(
+def encode_predict_reply(
     outputs: dict[str, Any],
     *,
     seq: int,
     server_id: str,
-    queue_ms: float,
-    compute_ms: float,
+    server_queue_s: float,
+    server_compute_s: float,
 ) -> bytes:
-    """Encode output arrays and timing metadata."""
-    descriptors: list[dict[str, Any]] = []
-    frames: list[bytes] = []
-    for name, value in outputs.items():
-        array = np.ascontiguousarray(np.asarray(value))
-        if array.dtype.kind not in "biufc":
-            raise RemoteInferenceProtocolError(f"Output {name!r} must have a numeric or bool dtype")
-        descriptors.append(array_descriptor(name, array))
-        frames.append(array.tobytes())
-    return encode_payload(
-        {
-            "protocol_version": PROTOCOL_VERSION,
-            "seq": seq,
-            "server_id": server_id,
-            "ok": True,
-            "queue_ms": queue_ms,
-            "compute_ms": compute_ms,
-            "arrays": descriptors,
-        },
-        frames,
-    )
+    """Encode the complete model output map and server timing in a v1 reply."""
+    return encode_message({
+        "protocol_version": PROTOCOL_VERSION,
+        "seq": seq,
+        "server_id": server_id,
+        "outputs": outputs,
+        "server_queue_s": server_queue_s,
+        "server_compute_s": server_compute_s,
+    })
 
 
-def decode_response(payload: bytes) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-    """Decode and validate a successful inference response."""
-    metadata, frames = decode_payload(payload)
-    if metadata.get("protocol_version") != PROTOCOL_VERSION or metadata.get("ok") is not True:
-        raise RemoteInferenceProtocolError("Invalid inference response")
-    descriptors = metadata.get("arrays")
-    if not isinstance(descriptors, list) or len(descriptors) != len(frames):
-        raise RemoteInferenceProtocolError("Response metadata does not match data frames")
-    outputs: dict[str, np.ndarray] = {}
-    for descriptor, frame in zip(descriptors, frames, strict=True):
-        name, dtype, shape, expected_size, encoding = _checked_shape_dtype(
-            descriptor, max_bytes=DEFAULT_MAX_REQUEST_BYTES
-        )
-        if encoding != "raw" or len(frame) != expected_size:
-            raise RemoteInferenceProtocolError(f"Output {name!r} has invalid data")
-        outputs[name] = np.frombuffer(frame, dtype=dtype).reshape(shape).copy()
-    return metadata, outputs
-
-
-def encode_observation(
-    observation: dict[str, Any],
-    image_jpeg_quality: int = DEFAULT_IMAGE_JPEG_QUALITY,
-    command: str = "predict",
-) -> bytes:
-    """Backward-compatible encoder used by small protocol tests."""
-    return encode_request(
-        observation,
-        seq=0,
-        budget_ms=2000,
-        api="action_chunk" if command == "predict" else "call",
-        jpeg_quality=image_jpeg_quality,
-    )
-
-
-def decode_observation_parts(metadata: dict[str, Any], frames: list[bytes], command: str = "predict") -> dict[str, Any]:
-    """Decode observations from an already-unpacked legacy envelope."""
-    wrapped = encode_payload(metadata, frames)
-    _, inputs = decode_request(wrapped)
-    if command != "predict":
-        raise RemoteInferenceProtocolError("Unsupported inference command")
-    return inputs
-
-
-def decode_observation(payload: bytes) -> dict[str, Any]:
-    """Decode a complete request payload."""
-    _, inputs = decode_request(payload)
-    return inputs
-
-
-def encode_actions(actions: np.ndarray, server_latency_s: float | None = None) -> bytes:
-    """Compatibility encoder for an action-only response."""
-    latency_ms = 0.0 if server_latency_s is None else server_latency_s * 1000
-    return encode_response({"action": actions}, seq=0, server_id="", queue_ms=0.0, compute_ms=latency_ms)
-
-
-def decode_actions(payload: bytes) -> tuple[np.ndarray, float | None]:
-    """Compatibility decoder for an action-only response."""
-    metadata, outputs = decode_response(payload)
-    if "action" not in outputs:
-        raise RemoteInferenceProtocolError("Response has no action output")
-    return outputs["action"], float(metadata.get("compute_ms", 0.0)) / 1000
-
-
-def encode_model_outputs(outputs: dict[str, Any], server_latency_s: float) -> bytes:
-    """Compatibility encoder for generic model outputs."""
-    return encode_actions(outputs.get("action", np.empty((0,))), server_latency_s)
-
-
-def decode_model_outputs(payload: bytes) -> tuple[dict[str, np.ndarray], float | None]:
-    """Compatibility decoder for generic model outputs."""
-    metadata, outputs = decode_response(payload)
-    latency_ms = metadata.get("compute_ms")
-    return outputs, None if latency_ms is None else float(latency_ms) / 1000
+def decode_predict_reply(payload: bytes) -> dict[str, Any]:
+    """Decode and validate a v1 predict reply with recursively decoded arrays."""
+    message = decode_message(payload)
+    required = {
+        "protocol_version",
+        "seq",
+        "server_id",
+        "outputs",
+        "server_queue_s",
+        "server_compute_s",
+    }
+    version = message.get("protocol_version")
+    if (
+        set(message) != required
+        or not isinstance(version, int)
+        or isinstance(version, bool)
+        or version != PROTOCOL_VERSION
+    ):
+        raise RemoteInferenceProtocolError("Malformed prediction reply")
+    seq = message.get("seq")
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq < 0:
+        raise RemoteInferenceProtocolError("Prediction reply has an invalid sequence")
+    if not isinstance(message.get("server_id"), str) or not message["server_id"]:
+        raise RemoteInferenceProtocolError("Prediction reply has an invalid server_id")
+    outputs = message.get("outputs")
+    if not isinstance(outputs, dict) or any(not isinstance(key, str) for key in outputs):
+        raise RemoteInferenceProtocolError("Prediction outputs must be a string-keyed map")
+    if any(not isinstance(value, np.ndarray) for value in outputs.values()):
+        raise RemoteInferenceProtocolError("Prediction outputs must be NumPy arrays")
+    for field in ("server_queue_s", "server_compute_s"):
+        value = message.get(field)
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise RemoteInferenceProtocolError(f"Prediction reply has invalid {field}")
+    return message

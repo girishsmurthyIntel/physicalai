@@ -168,8 +168,8 @@ class RerunCallback:
         if event.server_latency_s is not None:
             self._server_latencies.append(event.server_latency_s)
             rr.log("inference/server_latency_ms", rr.Scalars(event.server_latency_s * 1000.0))
-            network_ms = max(0.0, (event.latency_s - event.server_latency_s) * 1000.0)
-            rr.log("inference/network_latency_ms", rr.Scalars(network_ms))
+            transport_serialization_ms = max(0.0, (event.latency_s - event.server_latency_s) * 1000.0)
+            rr.log("inference/transport_and_serialization_ms", rr.Scalars(transport_serialization_ms))
 
         # Inference latency stats as a live-updating table.
         self._latencies.append(event.latency_s)
@@ -369,11 +369,11 @@ class RerunCallback:
             server_arr = np.array(self._server_latencies)
             s_last = float(server_arr[-1])
             s_p50 = float(np.percentile(server_arr, 50))
-            net_last = max(0.0, (last - s_last) * 1000.0)
+            transport_last = max(0.0, (last - s_last) * 1000.0)
             lines.extend([
                 f"| **Server Compute (last)** | {s_last * 1000:.1f} ms |",
                 f"| **Server Compute (p50)** | {s_p50 * 1000:.1f} ms |",
-                f"| **Network Transport (last)** | {net_last:.1f} ms |",
+                f"| **Transport + (de)serialisation (last)** | {transport_last:.1f} ms |",
             ])
 
         lines.extend([

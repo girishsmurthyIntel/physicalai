@@ -24,6 +24,7 @@ from physicalai.transport._zenoh import endpoint_for_key, make_zenoh_config, mod
 
 from ._protocol import (
     DEFAULT_IMAGE_JPEG_QUALITY,
+    DEFAULT_MAX_REQUEST_BYTES,
     PROTOCOL_VERSION,
     ImageCodec,
     RemoteInferenceError,
@@ -33,10 +34,10 @@ from ._protocol import (
     RemoteInferenceUnavailableError,
     RemoteTiming,
     decode_error,
-    decode_payload,
-    decode_response,
-    encode_payload,
-    encode_request,
+    decode_message,
+    decode_predict_reply,
+    encode_message,
+    encode_predict_request,
 )
 
 logger = logging.getLogger(__name__)
@@ -94,6 +95,8 @@ class RemoteInferenceModel(InferenceModel):
         self._jpeg_quality = jpeg_quality
         self._max_image_side = max_image_side
         self._zenoh_config_path = Path(zenoh_config) if zenoh_config is not None else None
+        if self._zenoh_config_path is not None:
+            logger.warning("user config %s replaces the secure Zenoh defaults", self._zenoh_config_path)
         self._builtin_config = None
         if self._zenoh_config_path is None:
             self._builtin_config = make_zenoh_config(
@@ -102,6 +105,10 @@ class RemoteInferenceModel(InferenceModel):
                 listen_endpoints=[],
                 multicast_enabled=False,
                 gossip_enabled=False,
+            )
+            self._builtin_config.insert_json5(
+                "transport/link/rx/max_message_size",
+                str(DEFAULT_MAX_REQUEST_BYTES),
             )
 
         self._lock = threading.RLock()
@@ -112,6 +119,7 @@ class RemoteInferenceModel(InferenceModel):
         self._server_id: str | None = None
         self._last_timing: RemoteTiming | None = None
         self._action_buffer: deque[np.ndarray] = deque()
+        self._predict_in_flight = False
 
     def connect(self) -> None:
         """Open the session, declare queriers, and validate the server handshake."""
@@ -135,8 +143,11 @@ class RemoteInferenceModel(InferenceModel):
                 for key in (f"{self._key_prefix}/metadata", f"{self._key_prefix}/predict", f"{self._key_prefix}/reset"):
                     self._queriers[key.rsplit("/", maxsplit=1)[-1]] = self._session.declare_querier(
                         key,
+                        target=zenoh.QueryTarget.BEST_MATCHING,
                         consolidation=zenoh.ConsolidationMode.NONE,
                         timeout=self._request_timeout_s,
+                        congestion_control=zenoh.CongestionControl.BLOCK,
+                        priority=zenoh.Priority.INTERACTIVE_HIGH,
                     )
                 deadline = time.monotonic() + self._request_timeout_s
                 while not self._all_queries_match():
@@ -147,25 +158,17 @@ class RemoteInferenceModel(InferenceModel):
                             "address reachable?"
                         )
                     time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
-                request_seq = self._next_seq()
-                request = encode_payload(
-                    {
-                        "protocol_version": PROTOCOL_VERSION,
-                        "command": "metadata",
-                        "seq": request_seq,
-                        "budget_ms": int(self._request_timeout_s * 1000),
-                    },
-                    [],
-                )
+                request = encode_message({"protocol_version": PROTOCOL_VERSION})
                 started = time.monotonic()
-                metadata = self._query_metadata(request, request_seq)
+                metadata = self._query_metadata(request)
                 self._validate_handshake(metadata)
                 self._metadata = metadata
                 self._server_id = metadata["server_id"]
-                self.policy_name = str(metadata.get("policy_name") or self._name)
+                policy = metadata["policy"]
+                self.policy_name = str(policy["name"])
                 self._last_timing = None
                 elapsed = time.monotonic() - started
-                rtc_supported = bool(metadata.get("rtc_supported"))
+                rtc_supported = metadata["rtc"]["supported"]
                 rtc = metadata.get("rtc", {})
                 chunk_size = (
                     rtc.get("chunk_size") if rtc_supported and isinstance(rtc, dict) else metadata.get("chunk_size")
@@ -174,8 +177,8 @@ class RemoteInferenceModel(InferenceModel):
                     "Connected to inference server %r: policy=%r, manifest_sha256=%r, chunk_size=%s "
                     "rtc_supported=%s (handshake %.3fs)",
                     self._name,
-                    metadata.get("policy_name"),
-                    metadata.get("manifest_sha256"),
+                    policy["name"],
+                    policy["manifest_sha256"],
                     chunk_size,
                     rtc_supported,
                     elapsed,
@@ -195,15 +198,14 @@ class RemoteInferenceModel(InferenceModel):
         """Run the generic InferenceModel call interface remotely."""
         with self._lock:
             self.connect()
-            metadata, outputs = self._predict(inputs, api="call")
-            del metadata
+            _, outputs = self._predict(inputs)
             return outputs
 
     def predict_action_chunk(self, observation: dict[str, Any]) -> np.ndarray:
         """Return a two-dimensional action chunk, stripping a singleton batch."""
         with self._lock:
             self.connect()
-            _, outputs = self._predict(observation, api="action_chunk")
+            _, outputs = self._predict(observation)
             if ACTION not in outputs:
                 raise RemoteInferenceProtocolError("Remote response has no action output")
             actions = outputs[ACTION]
@@ -229,17 +231,8 @@ class RemoteInferenceModel(InferenceModel):
         """Reset the remote policy on the model-owning server worker."""
         with self._lock:
             self.connect()
-            seq = self._next_seq()
-            request = encode_payload(
-                {
-                    "protocol_version": PROTOCOL_VERSION,
-                    "command": "reset",
-                    "seq": seq,
-                    "budget_ms": int(self._request_timeout_s * 1000),
-                },
-                [],
-            )
-            self._send("reset", request, seq)
+            request = encode_message({"protocol_version": PROTOCOL_VERSION})
+            self._send("reset", request, None)
             self._action_buffer.clear()
             self._last_timing = None
 
@@ -272,7 +265,7 @@ class RemoteInferenceModel(InferenceModel):
         with self._lock:
             self.connect()
             rtc = self._metadata.get("rtc", {})
-            if self._metadata.get("rtc_supported") and isinstance(rtc, dict) and "chunk_size" in rtc:
+            if rtc.get("supported") and rtc.get("chunk_size") is not None:
                 return int(rtc["chunk_size"])
             return int(self._metadata["chunk_size"])
 
@@ -290,7 +283,7 @@ class RemoteInferenceModel(InferenceModel):
     @property
     def last_server_latency_s(self) -> float | None:
         """Compatibility view used by existing execution latency trackers."""
-        return self._last_timing.compute_s if self._last_timing is not None else None
+        return self._last_timing.server_compute_s if self._last_timing is not None else None
 
     def _all_queries_match(self) -> bool:
         for querier in self._queriers.values():
@@ -307,83 +300,107 @@ class RemoteInferenceModel(InferenceModel):
                 f"Remote protocol version {metadata.get('protocol_version')!r} does not match {PROTOCOL_VERSION}"
             )
         if metadata.get("name") != self._name:
-            raise RemoteInferenceModelMismatchError(
+            raise RemoteInferenceProtocolError(
                 f"Server name {metadata.get('name')!r} does not match requested name {self._name!r}"
             )
         server_id = metadata.get("server_id")
+        policy = metadata.get("policy")
         chunk_size = metadata.get("chunk_size")
         rtc = metadata.get("rtc", {})
         if not isinstance(server_id, str) or not server_id:
             raise RemoteInferenceProtocolError("Server metadata has no server_id")
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
             raise RemoteInferenceProtocolError("Server metadata has an invalid chunk_size")
-        if not isinstance(rtc, dict) or not isinstance(metadata.get("rtc_supported"), bool):
+        if not isinstance(policy, dict) or any(
+            not isinstance(policy.get(field), str) for field in ("name", "manifest_sha256", "backend", "device")
+        ):
+            raise RemoteInferenceProtocolError("Server metadata has invalid policy identity")
+        if not isinstance(rtc, dict) or not isinstance(rtc.get("supported"), bool):
             raise RemoteInferenceProtocolError("Server metadata has invalid RTC information")
         rtc_chunk_size = rtc.get("chunk_size")
         if (
-            metadata["rtc_supported"]
+            rtc["supported"]
             and rtc_chunk_size is not None
             and (not isinstance(rtc_chunk_size, int) or isinstance(rtc_chunk_size, bool) or rtc_chunk_size < 1)
         ):
             raise RemoteInferenceProtocolError("Server metadata has an invalid RTC chunk_size")
-        if self._expected_policy is not None and metadata.get("policy_name") != self._expected_policy:
-            raise RemoteInferenceModelMismatchError(
-                f"Expected policy {self._expected_policy!r}, got {metadata.get('policy_name')!r}"
-            )
-        if (
-            self._expected_manifest_sha256 is not None
-            and metadata.get("manifest_sha256") != self._expected_manifest_sha256
+        if not isinstance(metadata.get("cameras"), list) or any(
+            not isinstance(camera, dict)
+            or not isinstance(camera.get("name"), str)
+            or not isinstance(camera.get("shape"), list)
+            for camera in metadata["cameras"]
         ):
+            raise RemoteInferenceProtocolError("Server metadata has invalid camera information")
+        if metadata.get("image_codecs") != ["jpeg", "raw"]:
+            raise RemoteInferenceProtocolError("Server metadata has invalid image codecs")
+        max_request_bytes = metadata.get("max_request_bytes")
+        if not isinstance(max_request_bytes, int) or isinstance(max_request_bytes, bool) or max_request_bytes < 1:
+            raise RemoteInferenceProtocolError("Server metadata has invalid max_request_bytes")
+        if self._expected_policy is not None and policy["name"] != self._expected_policy:
+            raise RemoteInferenceModelMismatchError(
+                f"Expected policy {self._expected_policy!r}, got {policy['name']!r}"
+            )
+        if self._expected_manifest_sha256 is not None and policy["manifest_sha256"] != self._expected_manifest_sha256:
             raise RemoteInferenceModelMismatchError("Remote manifest SHA-256 does not match the expected value")
 
-    def _query_metadata(self, payload: bytes, seq: int) -> dict[str, Any]:
-        reply = self._receive_matching_reply("metadata", payload, seq)
+    def _query_metadata(self, payload: bytes) -> dict[str, Any]:
+        reply = self._receive_matching_reply("metadata", payload, None)
         if reply.err is not None:
-            self._raise_remote_error(bytes(reply.err.payload), seq)
+            self._raise_remote_error(bytes(reply.err.payload), None)
         if reply.ok is None:
             raise RemoteInferenceProtocolError("Metadata query returned an empty reply")
-        metadata, frames = decode_payload(bytes(reply.ok.payload))
-        if frames or metadata.get("seq") != seq or metadata.get("ok") is not True:
-            raise RemoteInferenceProtocolError("Invalid metadata handshake response")
+        metadata = decode_message(bytes(reply.ok.payload))
         return metadata
 
-    def _predict(self, inputs: dict[str, Any], *, api: str) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-        seq = self._next_seq()
-        payload = encode_request(
-            inputs,
-            seq=seq,
-            budget_ms=int(self._request_timeout_s * 1000),
-            api=api,  # type: ignore[arg-type]
-            image_codec=self._image_codec,
-            jpeg_quality=self._jpeg_quality,
-            max_image_side=self._max_image_side,
-        )
-        started = time.monotonic()
-        reply = self._receive_matching_reply("predict", payload, seq)
-        if reply.err is not None:
-            self._raise_remote_error(bytes(reply.err.payload), seq)
-        if reply.ok is None:
-            raise RemoteInferenceProtocolError("Prediction query returned an empty reply")
-        metadata, outputs = decode_response(bytes(reply.ok.payload))
-        self._validate_response(metadata, seq)
-        self._last_timing = RemoteTiming(
-            seq=seq,
-            round_trip_s=time.monotonic() - started,
-            queue_s=float(metadata.get("queue_ms", 0)) / 1000,
-            compute_s=float(metadata.get("compute_ms", 0)) / 1000,
-        )
-        return metadata, outputs
+    def _predict(self, inputs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+        if self._predict_in_flight:
+            raise RemoteInferenceError("A prediction request is already in flight for this client")
+        self._predict_in_flight = True
+        try:
+            self._last_timing = None
+            round_trip_started = time.perf_counter()
+            seq = self._next_seq()
+            encode_started = time.perf_counter()
+            payload = encode_predict_request(
+                inputs,
+                seq=seq,
+                budget_ms=int(self._request_timeout_s * 1000),
+                image_codec=self._image_codec,
+                jpeg_quality=self._jpeg_quality,
+                max_image_side=self._max_image_side,
+            )
+            encode_s = time.perf_counter() - encode_started
+            request_bytes = len(payload)
+            reply = self._receive_matching_reply("predict", payload, seq)
+            if reply.err is not None:
+                self._raise_remote_error(bytes(reply.err.payload), seq)
+            if reply.ok is None:
+                raise RemoteInferenceProtocolError("Prediction query returned an empty reply")
+            reply_payload = bytes(reply.ok.payload)
+            decode_started = time.perf_counter()
+            metadata = decode_predict_reply(reply_payload)
+            decode_s = time.perf_counter() - decode_started
+            self._validate_response(metadata, seq)
+            self._last_timing = RemoteTiming(
+                round_trip_s=time.perf_counter() - round_trip_started,
+                server_queue_s=float(metadata["server_queue_s"]),
+                server_compute_s=float(metadata["server_compute_s"]),
+                encode_s=encode_s,
+                decode_s=decode_s,
+                request_bytes=request_bytes,
+                reply_bytes=len(reply_payload),
+            )
+            return metadata, metadata["outputs"]
+        finally:
+            self._predict_in_flight = False
 
-    def _receive_matching_reply(self, name: str, payload: bytes, seq: int) -> Any:
+    def _receive_matching_reply(self, name: str, payload: bytes, seq: int | None) -> Any:
         if self._session is None:
             raise RemoteInferenceUnavailableError("Remote inference session is not connected")
-        key_expr = f"{self._key_prefix}/{name}"
-        receiver = self._session.get(
-            key_expr,
-            payload=payload,
-            timeout=self._request_timeout_s,
-            consolidation=zenoh.ConsolidationMode.NONE,
-        )
+        querier = self._queriers.get(name)
+        if querier is None:
+            raise RemoteInferenceUnavailableError(f"Remote inference querier {name!r} is not declared")
+        receiver = querier.get(payload=payload)
         while True:
             try:
                 reply = receiver.recv()
@@ -399,16 +416,17 @@ class RemoteInferenceModel(InferenceModel):
                 error_payload = bytes(reply.err.payload)
                 if error_payload.strip().lower() == b"timeout":
                     raise RemoteInferenceTimeoutError(
-                        f"Remote inference request {seq} timed out after {self._request_timeout_s:.3f}s"
+                        f"Remote inference request {seq if seq is not None else name} timed out "
+                        f"after {self._request_timeout_s:.3f}s"
                     )
                 error_metadata = decode_error(error_payload)
-                if error_metadata.get("seq") != seq:
+                if seq is not None and error_metadata.get("seq") != seq:
                     continue
                 return reply
             if reply.ok is None:
                 continue
-            metadata, _ = decode_payload(bytes(reply.ok.payload))
-            if metadata.get("seq") != seq:
+            message = decode_message(bytes(reply.ok.payload))
+            if seq is not None and message.get("seq") != seq:
                 continue
             return reply
 
@@ -419,7 +437,7 @@ class RemoteInferenceModel(InferenceModel):
             raise RemoteInferenceProtocolError("Prediction response protocol version mismatch")
         if not isinstance(response_seq, int) or isinstance(response_seq, bool) or response_seq != seq:
             raise RemoteInferenceProtocolError("Prediction response sequence mismatch")
-        for field in ("queue_ms", "compute_ms"):
+        for field in ("server_queue_s", "server_compute_s"):
             value = metadata.get(field)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
                 raise RemoteInferenceProtocolError(f"Prediction response has invalid {field}")
@@ -427,28 +445,25 @@ class RemoteInferenceModel(InferenceModel):
         if not isinstance(server_id, str) or server_id != self._server_id:
             raise RemoteInferenceModelMismatchError("Inference server restarted or was replaced")
 
-    def _send(self, name: str, payload: bytes, seq: int) -> dict[str, Any]:
+    def _send(self, name: str, payload: bytes, seq: int | None) -> dict[str, Any]:
         reply = self._receive_matching_reply(name, payload, seq)
         if reply.err is not None:
             self._raise_remote_error(bytes(reply.err.payload), seq)
         if reply.ok is None:
             raise RemoteInferenceProtocolError("Remote request returned an empty reply")
-        metadata, frames = decode_payload(bytes(reply.ok.payload))
-        if (
-            frames
-            or metadata.get("protocol_version") != PROTOCOL_VERSION
-            or metadata.get("seq") != seq
-            or metadata.get("ok") is not True
-        ):
-            raise RemoteInferenceProtocolError("Invalid remote request response")
-        self._validate_response(metadata, seq)
-        return metadata
+        response = decode_message(bytes(reply.ok.payload))
+        if response != {"protocol_version": PROTOCOL_VERSION, "ok": True}:
+            raise RemoteInferenceProtocolError("Invalid reset response")
+        return response
 
-    def _raise_remote_error(self, payload: bytes, seq: int) -> None:
+    def _raise_remote_error(self, payload: bytes, seq: int | None) -> None:
         metadata = decode_error(payload)
         if metadata.get("protocol_version") != PROTOCOL_VERSION:
             raise RemoteInferenceProtocolError("Remote error protocol version mismatch")
-        if metadata.get("seq") != seq:
+        error_seq = metadata.get("seq")
+        if not isinstance(error_seq, int) or isinstance(error_seq, bool):
+            raise RemoteInferenceProtocolError("Remote error has an invalid sequence")
+        if seq is not None and error_seq != seq:
             raise RemoteInferenceProtocolError("Remote error sequence mismatch")
         code = metadata.get("code")
         if code == "expired":
