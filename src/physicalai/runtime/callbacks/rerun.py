@@ -30,7 +30,8 @@ class RerunCallback:
     Requires ``physicalai[observer-rerun]``.  Logs scalars and chunks every
     tick / inference event, and camera frames (from ``TickEvent.camera_frames``
     — the same values the action source saw that tick, no independent camera
-    read) at ``image_decimation``-th tick. Camera names for the blueprint
+    read) every ``image_decimation``-th source-updated tick (interpolated ticks
+    carry no frames and are not counted). Camera names for the blueprint
     layout are discovered lazily from the first tick's ``camera_frames`` keys,
     so this callback never holds a ``Camera`` reference of its own.
 
@@ -68,7 +69,9 @@ class RerunCallback:
         self._application_id = application_id
 
         self._last_step: int = 0
+        self._source_ticks: int = 0
         self._fps: float = 30.0
+        self._multiplier: int = 1
         self._pred_horizon: int = 0
         self._initialized = False
         self._blueprint_updated = False
@@ -78,8 +81,10 @@ class RerunCallback:
         self._server_queues: deque[float] = deque(maxlen=200)
 
     def on_lifecycle(self, event: LifecycleEvent) -> None:  # noqa: D102
-        if event.event == "start" and not self._initialized:
-            self._init_rerun(event.session_id, event.metadata)
+        if event.event == "start":
+            self._source_ticks = 0
+            if not self._initialized:
+                self._init_rerun(event.session_id, event.metadata)
         self._log_lifecycle_marker(event)
 
     def on_tick(self, event: TickEvent) -> None:  # noqa: D102
@@ -108,8 +113,10 @@ class RerunCallback:
             if self._camera_names:
                 self._send_default_blueprint()
 
-        if self._log_images and event.step % self._image_decimation == 0:
-            self._log_camera_frames(event.camera_frames)
+        if event.source_updated:
+            if self._log_images and self._source_ticks % self._image_decimation == 0:
+                self._log_camera_frames(event.camera_frames)
+            self._source_ticks += 1
 
     @staticmethod
     def on_metrics(event: MetricsEvent) -> None:
@@ -145,7 +152,10 @@ class RerunCallback:
         # Batch-log all prediction steps in one efficient send_columns call.
         # send_columns bypasses the thread-local time context, so the viewer's
         # "latest" cursor is not pushed to the last prediction step.
-        steps = np.arange(start_step, start_step + horizon, dtype=np.int64)
+        # The step timeline runs at control rate (fps * multiplier); each predicted
+        # action is reached on the last interpolated substep of its cycle.
+        m = self._multiplier
+        steps = start_step + (m - 1) + np.arange(horizon, dtype=np.int64) * m
         wall_times = event.timestamp + np.arange(horizon, dtype=np.float64) / self._fps
 
         # Scalars expects one float per row when logging a single series,
@@ -203,6 +213,7 @@ class RerunCallback:
             rr.connect_grpc(url=url)
 
         self._fps = metadata.get("fps", 30)
+        self._multiplier = int(metadata.get("interpolation_multiplier", 1))
         self._joint_names: list[str] = metadata.get("joint_names", [])
         self._initialized = True
 
@@ -266,7 +277,7 @@ class RerunCallback:
         # so the cursor sits roughly `horizon` steps ahead of the actual tick.
         # We size the visible window so actions and predictions get equal space:
         # lookback = 2*horizon → horizon steps of history + horizon steps of predictions.
-        lookback = horizon * 2
+        lookback = horizon * self._multiplier * 2
         actions_range = rrb.VisibleTimeRange(
             timeline="step",
             start=rrb.TimeRangeBoundary.cursor_relative(seq=-lookback),

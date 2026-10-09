@@ -11,6 +11,7 @@ Public API::
     from physicalai.runtime import SyncExecution, AsyncExecution, Execution, WorkerDiedError
     from physicalai.runtime import ActionQueue, ChunkedActionQueue
     from physicalai.runtime import ChunkSmoother, LerpSmoother, ReplaceSmoother
+    from physicalai.runtime import ActionInterpolator, LinearInterpolator
     from physicalai.runtime import TickEvent, InferenceEvent, LifecycleEvent, MetricsEvent
     from physicalai.runtime import ConsoleCallback, JsonlCallback, AsyncCallback, RerunCallback
 """
@@ -39,6 +40,7 @@ from physicalai.runtime.execution import (
     SyncExecution,
     WorkerDiedError,
 )
+from physicalai.runtime.interpolation import ActionInterpolator, LinearInterpolator
 from physicalai.runtime.smoothers import ChunkSmoother, LerpSmoother, ReplaceSmoother
 
 if TYPE_CHECKING:
@@ -55,6 +57,7 @@ def __getattr__(name: str) -> object:
 
 
 __all__ = [
+    "ActionInterpolator",
     "ActionQueue",
     "ActionSource",
     "AsyncCallback",
@@ -67,6 +70,7 @@ __all__ = [
     "JsonlCallback",
     "LerpSmoother",
     "LifecycleEvent",
+    "LinearInterpolator",
     "LowPassFilterCallback",
     "MetricsEvent",
     "PolicySource",
