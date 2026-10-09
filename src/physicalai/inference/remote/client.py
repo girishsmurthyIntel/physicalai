@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import copy
 import logging
 import math
@@ -486,10 +487,8 @@ class RemoteInferenceModel(InferenceModel):
 
     def _close_locked(self) -> None:
         for querier in self._queriers.values():
-            try:
+            with contextlib.suppress(Exception):
                 querier.undeclare()
-            except Exception:
-                pass
         self._queriers.clear()
         if self._session is not None:
             try:
