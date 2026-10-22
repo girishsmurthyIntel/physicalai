@@ -12,7 +12,7 @@ import socket
 import threading
 import time
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
 
 import msgpack
 import numpy as np
@@ -21,6 +21,8 @@ import pytest
 zenoh = pytest.importorskip("zenoh")
 
 from physicalai.inference.constants import ACTION, PREV_CHUNK_LEFT_OVER, RTC_INFERENCE_DELAY  # noqa: E402
+from physicalai.inference.manifest import Manifest  # noqa: E402
+from physicalai.inference.model import InferenceModel  # noqa: E402
 from physicalai.inference.remote import (  # noqa: E402
     InferenceServer,
     RemoteInferenceModel,
@@ -50,16 +52,24 @@ from physicalai.runtime.execution.sync import SyncExecution  # noqa: E402
 from physicalai.transport._zenoh import endpoint_for_key, model_key_prefix  # noqa: E402
 
 
-class _Model:
+class _Model(InferenceModel):
     def __init__(self, policy_name: str) -> None:
         self.policy_name = policy_name
         self.predict_count = 0
         self.call_count = 0
         self.reset_count = 0
         self.reset_thread_id: int | None = None
-        self.chunk_size = 4
-        self.manifest = type("Manifest", (), {"model_extra": {"rtc": {}}})()
+        self._chunk_size = 4
+        self.manifest = Manifest.model_validate({"rtc": {}})
         self.last_call_inputs: dict[str, Any] | None = None
+
+    @property
+    def chunk_size(self) -> int:
+        return self._chunk_size
+
+    @chunk_size.setter
+    def chunk_size(self, value: int) -> None:
+        self._chunk_size = value
 
     def predict_action_chunk(self, observation: dict[str, Any]) -> np.ndarray:
         self.predict_count += 1
@@ -139,7 +149,7 @@ def test_client_accepts_matching_policy_and_manifest_pins(tmp_path: Any) -> None
     (tmp_path / "manifest.json").write_bytes(manifest_bytes)
     model = _Model("pi05")
     model.export_dir = tmp_path
-    model.manifest.policy = SimpleNamespace(name="pi05")
+    model.manifest = Manifest.model_validate({"policy": {"name": "pi05"}, "rtc": {}})
     port = _free_port()
     server = InferenceServer(model, "cell1-act", port=port)
     server.start()
@@ -432,7 +442,7 @@ def test_predict_timeout_is_typed_and_not_retried(monkeypatch: pytest.MonkeyPatc
 
     client = RemoteInferenceModel("no-retry", port=14570, request_timeout_s=0.05)
     querier = _Querier()
-    client._session = object()  # noqa: SLF001
+    client._session = cast(zenoh.Session, object())  # noqa: SLF001
     client._server_id = "test-server"  # noqa: SLF001
     client._queriers["predict"] = querier  # noqa: SLF001
     monkeypatch.setattr(client, "connect", lambda: None)
@@ -488,9 +498,11 @@ def test_metadata_reply_schema_and_manifest_hash_are_v1(tmp_path: Any) -> None:
     manifest_data = b'{"policy":{"name":"pi05"}}'
     (tmp_path / "manifest.json").write_bytes(manifest_data)
     model.export_dir = tmp_path
-    model.manifest.policy = SimpleNamespace(name="pi05")
-    model.manifest.hardware = SimpleNamespace(cameras=[SimpleNamespace(name="wrist", shape=[3, 480, 640])])
-    model.manifest.model_extra["rtc"] = {"chunk_size": 4}
+    model.manifest = Manifest.model_validate({
+        "policy": {"name": "pi05"},
+        "hardware": {"cameras": [{"name": "wrist", "shape": [3, 480, 640]}]},
+        "rtc": {"chunk_size": 4},
+    })
     server = InferenceServer(model, "cell1-act")
 
     metadata = server._build_metadata()  # noqa: SLF001
@@ -720,7 +732,7 @@ def test_client_constructor_is_lazy_and_exports_its_public_config_path(monkeypat
     recipe = Config.from_instance(model)
     assert recipe.class_path == "physicalai.inference.RemoteInferenceModel"
     restored = recipe.instantiate(expected_type=InferenceModel)
-    assert isinstance(restored, InferenceModel)
+    assert isinstance(restored, RemoteInferenceModel)
     assert restored.host == model.host
     assert restored.port == model.port
     assert not hasattr(restored, "manifest")
@@ -1003,6 +1015,7 @@ def test_server_reports_decode_separately_without_extending_the_budget(
     class _Query:
         response: dict[str, Any] | None = None
         error: dict[str, Any] | None = None
+        payload: bytes
 
         def reply(self, key: str, data: bytes) -> None:
             self.response = decode_message(data)
@@ -1023,7 +1036,7 @@ def test_server_reports_decode_separately_without_extending_the_budget(
 
     monkeypatch.setattr(server_module.time, "monotonic", lambda: now[0])
     monkeypatch.setattr(server_module, "decode_predict_request", timed_decode)
-    server._on_query(query, "predict")  # noqa: SLF001
+    server._on_query(cast(zenoh.Query, query), "predict")  # noqa: SLF001
     now[0] += 0.02
     server._worker_loop()  # noqa: SLF001
 
@@ -1086,6 +1099,7 @@ def test_reset_roundtrip_runs_on_the_server_worker() -> None:
         client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
         client.reset()
         assert model.reset_count == 1
+        assert server._worker is not None  # noqa: SLF001
         assert model.reset_thread_id == server._worker.ident  # noqa: SLF001
     finally:
         client.close()
@@ -1108,7 +1122,7 @@ def test_predict_querier_can_be_reused() -> None:
 def test_client_uses_rtc_chunk_size_from_handshake_without_manifest() -> None:
     name = "rtc-handshake"
     model = _Model(name)
-    model.manifest.model_extra["rtc"] = {"chunk_size": 6}
+    model.manifest = Manifest.model_validate({"rtc": {"chunk_size": 6}})
     server = InferenceServer(model, name, port=_free_port())
     server.start()
     client = RemoteInferenceModel(name, port=server.port)
