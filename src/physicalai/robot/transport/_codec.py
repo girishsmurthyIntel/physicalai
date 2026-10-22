@@ -14,13 +14,14 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-import numpy as np
+from physicalai.transport import decode_payload as _decode_numpy_payload
+from physicalai.transport import encode_numpy as _encode_numpy
+from physicalai.transport import pack_msgpack, unpack_msgpack
 
-from physicalai.transport._codec import decode_payload as _decode_numpy_payload
-from physicalai.transport._codec import encode_numpy as _encode_numpy
-from physicalai.transport._codec import pack_msgpack, unpack_msgpack
+if TYPE_CHECKING:
+    import numpy as np
 
 ROBOT_TRANSPORT_PROTOCOL_VERSION = 1
 """Version of the robot transport wire contract (not the robot class or
@@ -64,7 +65,8 @@ def _unpack_payload(data: bytes) -> dict[str, Any]:
         payload = unpack_msgpack(data, max_bytes=_MAX_PAYLOAD_BYTES, max_depth=_MAX_PAYLOAD_DEPTH)
     except ValueError as error:
         if "exceeds the" in str(error):
-            raise ValueError(f"Robot transport payload {error}") from error
+            msg = f"Robot transport payload {error}"
+            raise ValueError(msg) from error
         raise
     if not isinstance(payload, dict):
         msg = f"Expected a dict payload, got {type(payload).__name__}"
@@ -123,11 +125,7 @@ def encode_state(
         "joint_positions": _encode_numpy(joint_positions),
         "state": _encode_numpy(state),
         "timestamp": timestamp,
-        "sensor_data": (
-            {k: _encode_numpy(v) for k, v in sensor_data.items()}
-            if sensor_data is not None
-            else None
-        ),
+        "sensor_data": ({k: _encode_numpy(v) for k, v in sensor_data.items()} if sensor_data is not None else None),
     }
     return _pack_payload(payload)
 

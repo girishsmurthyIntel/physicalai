@@ -5,6 +5,7 @@
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import ipaddress
 import logging
@@ -14,14 +15,13 @@ import uuid
 from collections import deque
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import msgpack
 import numpy as np
 import zenoh
 
-from physicalai.inference.model import InferenceModel
-from physicalai.transport._zenoh import derive_port, endpoint_for_key, make_zenoh_config, model_key_prefix
+from physicalai.transport import derive_port, endpoint_for_key, make_zenoh_config, model_key_prefix
 
 from ._protocol import (
     DEFAULT_MAX_REQUEST_BYTES,
@@ -32,6 +32,9 @@ from ._protocol import (
     encode_message,
     encode_predict_reply,
 )
+
+if TYPE_CHECKING:
+    from physicalai.inference.model import InferenceModel
 
 logger = logging.getLogger(__name__)
 _SUMMARY_INTERVAL_S = 30.0
@@ -64,16 +67,23 @@ class InferenceServer:
         zenoh_config: str | Path | None = None,
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
     ) -> None:
+        """Configure the model worker and listener without opening a session.
+
+        Raises:
+            ValueError: If the name, address, request limit, or wildcard opt-in is invalid.
+        """
         self._key_prefix = model_key_prefix(name)
         if not isinstance(max_request_bytes, int) or isinstance(max_request_bytes, bool) or max_request_bytes < 1:
-            raise ValueError("max_request_bytes must be a positive integer")
+            msg = "max_request_bytes must be a positive integer"
+            raise ValueError(msg)
         self._name = name
         self._model = model
         self._host = host
         self._port = derive_port("inference", name) if port is None else port
         self._listen = endpoint_for_key(self._key_prefix, host, self._port)
         if self._is_wildcard_host(host) and not allow_all_interfaces:
-            raise ValueError("Wildcard hosts require allow_all_interfaces=True")
+            msg = "Wildcard hosts require allow_all_interfaces=True"
+            raise ValueError(msg)
         self._allow_all_interfaces = allow_all_interfaces
         self._zenoh_config_path = Path(zenoh_config) if zenoh_config is not None else None
         if self._zenoh_config_path is not None:
@@ -111,12 +121,17 @@ class InferenceServer:
         return self._port
 
     def start(self) -> None:
-        """Open the peer session and worker without blocking."""
+        """Open the peer session and worker without blocking.
+
+        Raises:
+            RuntimeError: If this server was already stopped.
+        """
         with self._lifecycle_lock:
             if self._started.is_set():
                 return
             if self._stopping.is_set():
-                raise RuntimeError("InferenceServer cannot be restarted after stop()")
+                msg = "InferenceServer cannot be restarted after stop()"
+                raise RuntimeError(msg)
             self._server_id = uuid.uuid4().hex
             self._metadata = self._build_metadata()
             config = self._build_config()
@@ -217,10 +232,8 @@ class InferenceServer:
         export_dir = getattr(self._model, "export_dir", None)
         if export_dir is not None:
             manifest_path = Path(export_dir) / "manifest.json"
-            try:
+            with contextlib.suppress(OSError):
                 manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-            except OSError:
-                pass
         hardware = getattr(manifest, "hardware", None)
         cameras = [{"name": camera.name, "shape": list(camera.shape)} for camera in getattr(hardware, "cameras", [])]
         return {
@@ -274,56 +287,62 @@ class InferenceServer:
             self._reply_error(query, -1, "invalid_request")
             return
         try:
-            if command == "metadata":
-                metadata = decode_message(payload, max_bytes=self._max_request_bytes)
-                version = metadata.get("protocol_version")
-                if not isinstance(version, int) or isinstance(version, bool) or version != PROTOCOL_VERSION:
-                    self._reply_error(query, -1, "unsupported_version")
-                    return
-                if metadata != {"protocol_version": PROTOCOL_VERSION}:
-                    raise RemoteInferenceProtocolError("Metadata request must contain only protocol_version")
-                self._reply_metadata(query)
-                return
-            if command == "predict":
-                metadata, inputs = decode_predict_request(payload, max_bytes=self._max_request_bytes)
-                request = _Request(
-                    query=query,
-                    command="predict",
-                    seq=metadata["seq"],
-                    budget_ms=metadata["budget_ms"],
-                    received_at=received_at,
-                    request_bytes=len(payload),
-                    inputs=inputs,
-                    decoded_at=time.monotonic(),
-                )
-                self._enqueue(request)
-                return
-            if command == "reset":
-                metadata = decode_message(payload, max_bytes=self._max_request_bytes)
-                version = metadata.get("protocol_version")
-                if not isinstance(version, int) or isinstance(version, bool) or version != PROTOCOL_VERSION:
-                    self._reply_error(query, -1, "unsupported_version")
-                    return
-                if metadata != {"protocol_version": PROTOCOL_VERSION}:
-                    raise RemoteInferenceProtocolError("Reset request must contain only protocol_version")
-                request = _Request(
-                    query=query,
-                    command="reset",
-                    seq=-1,
-                    budget_ms=2**31 - 1,
-                    received_at=received_at,
-                    request_bytes=len(payload),
-                    decoded_at=time.monotonic(),
-                )
-                self._enqueue(request)
-                return
-            raise RemoteInferenceProtocolError("Unsupported query key")
+            self._handle_query(query, command, payload, received_at)
         except RemoteInferenceProtocolError:
             logger.debug("Rejected malformed remote inference request", exc_info=True)
             self._reply_error(query, self._read_seq(payload), "invalid_request")
         except Exception:
             logger.exception("Failed to decode remote inference request")
             self._reply_error(query, self._read_seq(payload), "invalid_request")
+
+    def _handle_query(self, query: zenoh.Query, command: str, payload: bytes, received_at: float) -> None:
+        if command == "metadata":
+            metadata = decode_message(payload, max_bytes=self._max_request_bytes)
+            version = metadata.get("protocol_version")
+            if not isinstance(version, int) or isinstance(version, bool) or version != PROTOCOL_VERSION:
+                self._reply_error(query, -1, "unsupported_version")
+                return
+            if metadata != {"protocol_version": PROTOCOL_VERSION}:
+                msg = "Metadata request must contain only protocol_version"
+                raise RemoteInferenceProtocolError(msg)
+            self._reply_metadata(query)
+            return
+        if command == "predict":
+            metadata, inputs = decode_predict_request(payload, max_bytes=self._max_request_bytes)
+            request = _Request(
+                query=query,
+                command="predict",
+                seq=metadata["seq"],
+                budget_ms=metadata["budget_ms"],
+                received_at=received_at,
+                request_bytes=len(payload),
+                inputs=inputs,
+                decoded_at=time.monotonic(),
+            )
+            self._enqueue(request)
+            return
+        if command == "reset":
+            metadata = decode_message(payload, max_bytes=self._max_request_bytes)
+            version = metadata.get("protocol_version")
+            if not isinstance(version, int) or isinstance(version, bool) or version != PROTOCOL_VERSION:
+                self._reply_error(query, -1, "unsupported_version")
+                return
+            if metadata != {"protocol_version": PROTOCOL_VERSION}:
+                msg = "Reset request must contain only protocol_version"
+                raise RemoteInferenceProtocolError(msg)
+            request = _Request(
+                query=query,
+                command="reset",
+                seq=-1,
+                budget_ms=2**31 - 1,
+                received_at=received_at,
+                request_bytes=len(payload),
+                decoded_at=time.monotonic(),
+            )
+            self._enqueue(request)
+            return
+        msg = "Unsupported query key"
+        raise RemoteInferenceProtocolError(msg)
 
     def _enqueue(self, request: _Request) -> None:
         with self._condition:
@@ -368,9 +387,7 @@ class InferenceServer:
                     self._model.reset()
                     outputs: dict[str, Any] = {}
                 else:
-                    outputs = self._model(request.inputs or {})
-                    if not isinstance(outputs, dict):
-                        raise TypeError("model __call__ must return a mapping of output arrays")
+                    outputs = self._run_model(request.inputs or {})
                 compute_ms = (time.monotonic() - compute_started) * 1000
                 if request.command == "reset":
                     response = encode_message({"protocol_version": PROTOCOL_VERSION, "ok": True})
@@ -400,10 +417,18 @@ class InferenceServer:
                 self._reply_error(request.query, request.seq, "model_error")
             self._maybe_log_summary()
 
-    def _reply_metadata(self, query: Any) -> None:
+    def _run_model(self, inputs: dict[str, Any]) -> dict[str, Any]:
+        outputs = self._model(inputs)
+        if not isinstance(outputs, dict):
+            msg = "model __call__ must return a mapping of output arrays"
+            raise TypeError(msg)
+        return outputs
+
+    def _reply_metadata(self, query: zenoh.Query) -> None:
         query.reply(self._metadata_key, encode_message(self._metadata))
 
-    def _reply_error(self, query: Any, seq: int, code: str) -> None:
+    @staticmethod
+    def _reply_error(query: zenoh.Query, seq: int, code: str) -> None:
         payload = encode_message(
             {"protocol_version": PROTOCOL_VERSION, "code": code, "seq": seq},
         )
@@ -412,7 +437,8 @@ class InferenceServer:
         except Exception:
             logger.debug("Unable to send remote inference error reply", exc_info=True)
 
-    def _log_request(self, request: _Request, queue_ms: float, compute_ms: float, outcome: str) -> None:
+    @staticmethod
+    def _log_request(request: _Request, queue_ms: float, compute_ms: float, outcome: str) -> None:
         decoded_at = request.decoded_at if request.decoded_at is not None else request.received_at
         logger.debug(
             "Remote inference request seq=%s bytes=%s decode_ms=%.3f queue_ms=%.3f compute_ms=%.3f outcome=%s",
@@ -458,7 +484,7 @@ class InferenceServer:
             unpacked = msgpack.unpackb(payload, raw=False, strict_map_key=False)
             seq = unpacked.get("seq", -1) if isinstance(unpacked, dict) else -1
             return seq if isinstance(seq, int) and not isinstance(seq, bool) else -1
-        except Exception:
+        except (msgpack.UnpackException, TypeError, ValueError, OverflowError):
             return -1
 
     def _undeclare_queryables(self) -> None:

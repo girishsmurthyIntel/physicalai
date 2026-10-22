@@ -15,9 +15,7 @@ from __future__ import annotations
 
 from typing import Any
 
-import zenoh
-
-from physicalai.transport._zenoh import endpoint_for_key, open_zenoh_session
+from physicalai.transport import endpoint_for_key, open_zenoh_session
 
 from ._ids import robot_prefix
 
@@ -60,6 +58,8 @@ def open_session(name: str | None = None, *, listen: bool = False, allow_remote:
     Returns:
         The open Zenoh session.
     """
+    import zenoh  # noqa: PLC0415
+
     connect_endpoints: list[str] | None = None
     listen_endpoints: list[str] | None = None
     config = zenoh.Config()

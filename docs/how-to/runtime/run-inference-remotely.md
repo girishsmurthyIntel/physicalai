@@ -194,31 +194,13 @@ decode-and-queue meaning.
 
 ## Troubleshooting
 
-| Symptom | Check |
-|---|---|
-| No matching server | Confirm the server process is running with the same `--name`; run `physicalai inference port NAME` on both ends and compare the derived port. |
-| SSH tunnel down | Restart `ssh -N -L P:127.0.0.1:P user@inference-host` on the client and keep it open; test the local forwarded port with `nc -vz 127.0.0.1 P`. |
-| Firewall blocks a direct connection | Allow inbound TCP `P` only from trusted client addresses in the host and cloud firewalls; verify with `nc -vz SERVER_IP P`. |
-| Port already in use | The server exits without selecting another port. Choose another `--name` or explicit `--port`, then update the client's `name` or `port` to match. |
-| Model mismatch | Compare the server's policy name and manifest SHA-256 with any client `expected_policy` / `expected_manifest_sha256` pins; ensure the export on the server is the intended version. |
-
-## Robots and GPUs
-
-One server process and model instance serves one robot. Two robots running the same policy need separate processes and slot names, such as `cell1-act` and `cell2-act`, and each client must use its matching name.
-
-For OpenVINO multi-GPU serving, run one process per GPU and use its device index:
-
-```bash
-uv run physicalai inference serve --name cell1-act --export-dir ~/models/pi05/openvino --backend openvino --device GPU.0
-uv run physicalai inference serve --name cell2-act --export-dir ~/models/pi05/openvino --backend openvino --device GPU.1
-```
-
-For ONNX with CUDA, isolate each process with `CUDA_VISIBLE_DEVICES`:
-
-```bash
-CUDA_VISIBLE_DEVICES=0 uv run physicalai inference serve --name cell1-act --export-dir ~/models/pi05/onnx --backend onnx --device cuda
-CUDA_VISIBLE_DEVICES=1 uv run physicalai inference serve --name cell2-act --export-dir ~/models/pi05/onnx --backend onnx --device cuda
-```
+| Symptom                             | Check                                                                                                                                                                               |
+| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No matching server                  | Confirm the server process is running with the same `--name`; run `physicalai inference port NAME` on both ends and compare the derived port.                                       |
+| SSH tunnel down                     | Restart `ssh -N -L P:127.0.0.1:P user@inference-host` on the client and keep it open; test the local forwarded port with `nc -vz 127.0.0.1 P`.                                      |
+| Firewall blocks a direct connection | Allow inbound TCP `P` only from trusted client addresses in the host and cloud firewalls; verify with `nc -vz SERVER_IP P`.                                                         |
+| Port already in use                 | The server exits without selecting another port. Choose another `--name` or explicit `--port`, then update the client's `name` or `port` to match.                                  |
+| Model mismatch                      | Compare the server's policy name and manifest SHA-256 with any client `expected_policy` / `expected_manifest_sha256` pins; ensure the export on the server is the intended version. |
 
 ## Trust Boundary
 

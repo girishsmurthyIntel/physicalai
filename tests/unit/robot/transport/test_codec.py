@@ -127,10 +127,8 @@ class TestMetadataRoundtrip:
         assert decode_metadata(encode_metadata(metadata)) == metadata
 
     def test_bad_payload_raises(self) -> None:
-        import msgpack
-
         with pytest.raises(TypeError, match="Expected a dict"):
-            decode_metadata(msgpack.packb([1, 2, 3]))
+            decode_metadata(pack_msgpack([1, 2, 3]))
 
     def test_oversized_payload_rejected_before_unpacking(self) -> None:
         oversized = b"\x00" * (1024 * 1024 + 1)
@@ -144,14 +142,12 @@ class TestMetadataRoundtrip:
         unpackb.assert_not_called()
 
     def test_deeply_nested_payload_rejected(self) -> None:
-        import msgpack
-
         payload: dict[str, object] = {"leaf": 1}
         for _ in range(100):
             payload = {"k": payload}
 
         with pytest.raises(ValueError, match="nesting exceeds"):
-            decode_metadata(msgpack.packb(payload, use_bin_type=True))
+            decode_metadata(pack_msgpack(payload))
 
 
 class TestSharedNumpyCodec:
@@ -167,6 +163,7 @@ class TestSharedNumpyCodec:
 
         encoded = pack_msgpack({"array": array})
         decoded = unpack_msgpack(encoded)
+        assert isinstance(decoded, dict)
         np.testing.assert_array_equal(decoded["array"], array)
 
     def test_scalar_array_shape_roundtrips_as_zero_dimensional(self) -> None:
@@ -174,6 +171,7 @@ class TestSharedNumpyCodec:
 
         decoded = unpack_msgpack(pack_msgpack({"scalar": scalar}))
 
+        assert isinstance(decoded, dict)
         assert decoded["scalar"].shape == ()
         assert decoded["scalar"].dtype == np.float32
         assert decoded["scalar"].item() == pytest.approx(3.5)

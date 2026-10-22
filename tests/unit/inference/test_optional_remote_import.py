@@ -7,20 +7,24 @@ import subprocess
 import sys
 import textwrap
 
+import pytest
 
-def test_cli_and_robot_codec_import_without_msgpack() -> None:
+
+@pytest.mark.parametrize("dependency", ["msgpack", "zenoh"])
+def test_cli_and_robot_codec_import_without_transport_dependency(dependency: str) -> None:
     script = textwrap.dedent(
-        """
+        f"""
         import builtins
 
         original_import = builtins.__import__
+        blocked_dependency = {dependency!r}
 
-        def block_msgpack(name, *args, **kwargs):
-            if name == "msgpack" or name.startswith("msgpack."):
-                raise ModuleNotFoundError("simulated missing optional msgpack dependency")
+        def block_optional(name, *args, **kwargs):
+            if name == blocked_dependency or name.startswith(blocked_dependency + "."):
+                raise ModuleNotFoundError("simulated missing optional dependency: " + blocked_dependency)
             return original_import(name, *args, **kwargs)
 
-        builtins.__import__ = block_msgpack
+        builtins.__import__ = block_optional
         import physicalai.cli.main
         import physicalai.cli.robot
         from physicalai.robot.transport import _codec

@@ -17,9 +17,12 @@ from typing import TYPE_CHECKING
 from jsonargparse import ArgumentParser
 
 from physicalai.cli._spec import SubcommandSpec  # noqa: PLC2701
-from physicalai.transport._zenoh import derive_port, model_key_prefix
+from physicalai.transport import derive_port, model_key_prefix
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+    from types import FrameType
+
     from jsonargparse import Namespace
 
 HELP = "Serve a policy over Zenoh or print its deterministic endpoint port."
@@ -65,7 +68,11 @@ def _build_port_parser() -> ArgumentParser:
 
 
 def build_parser() -> ArgumentParser:
-    """Build the nested ``physicalai inference`` parser."""
+    """Build the nested ``physicalai inference`` parser.
+
+    Returns:
+        The parser containing the serve and port subcommands.
+    """
     parser = ArgumentParser(prog="physicalai inference", description=HELP)
     subcommands = parser.add_subcommands(required=True)
     subcommands.add_subcommand("serve", _build_serve_parser(), help=_SERVE_HELP)
@@ -75,14 +82,14 @@ def build_parser() -> ArgumentParser:
 
 def print_help(prog: str) -> None:
     """Print lightweight group help."""
-    print(
+    print(  # noqa: T201
         _HELP_TEMPLATE.format(
             prog=prog,
             description=HELP,
             serve_help=_SERVE_HELP,
             port_help=_PORT_HELP,
         )
-    )  # noqa: T201
+    )
 
 
 def _serve(cfg: Namespace) -> int:
@@ -115,7 +122,7 @@ def _serve(cfg: Namespace) -> int:
     )
     logger = logging.getLogger(__name__)
     logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
-    previous_handlers: dict[signal.Signals, object] = {}
+    previous_handlers: dict[signal.Signals, Callable[[int, FrameType | None], object] | int | None] = {}
 
     def stop_server(_signum: int, _frame: object) -> None:
         server.stop()
@@ -158,15 +165,19 @@ def _port(cfg: Namespace) -> int:
     return 0
 
 
-def _dispatch(_parser: ArgumentParser, cfg: Namespace) -> int:
+def _dispatch(parser: ArgumentParser, cfg: Namespace) -> int:
     if cfg.subcommand == "serve":
         return _serve(cfg.serve)
     if cfg.subcommand == "port":
         return _port(cfg.port)
-    msg = f"unknown inference subcommand: {cfg.subcommand!r}"
+    msg = f"unknown inference subcommand for {parser.prog}: {cfg.subcommand!r}"
     raise AssertionError(msg)
 
 
 def register() -> SubcommandSpec:
-    """Register ``physicalai inference`` with the CLI host."""
+    """Register ``physicalai inference`` with the CLI host.
+
+    Returns:
+        The inference subcommand registration record.
+    """
     return SubcommandSpec(name="inference", parser=build_parser(), dispatch=_dispatch, help=HELP)

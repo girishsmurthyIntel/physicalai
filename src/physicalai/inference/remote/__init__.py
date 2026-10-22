@@ -3,7 +3,10 @@
 
 """Remote inference clients and servers."""
 
-from physicalai.inference.remote._protocol import (
+from physicalai.inference.remote.client import RemoteInferenceModel
+from physicalai.inference.remote.server import InferenceServer
+
+from ._protocol import (
     RemoteInferenceError,
     RemoteInferenceModelMismatchError,
     RemoteInferenceProtocolError,
@@ -11,8 +14,6 @@ from physicalai.inference.remote._protocol import (
     RemoteInferenceUnavailableError,
     RemoteTiming,
 )
-from physicalai.inference.remote.client import RemoteInferenceModel
-from physicalai.inference.remote.server import InferenceServer
 
 __all__ = [
     "InferenceServer",

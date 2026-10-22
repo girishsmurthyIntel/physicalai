@@ -21,11 +21,12 @@ import zenoh
 from physicalai.config import export_config
 from physicalai.inference.constants import ACTION
 from physicalai.inference.model import InferenceModel
-from physicalai.transport._zenoh import derive_port, endpoint_for_key, make_zenoh_config, model_key_prefix, open_zenoh_session
+from physicalai.transport import derive_port, endpoint_for_key, make_zenoh_config, model_key_prefix, open_zenoh_session
 
 from ._protocol import (
     DEFAULT_IMAGE_JPEG_QUALITY,
     DEFAULT_MAX_REQUEST_BYTES,
+    MAX_IMAGE_JPEG_QUALITY,
     PROTOCOL_VERSION,
     ImageCodec,
     RemoteInferenceError,
@@ -42,6 +43,8 @@ from ._protocol import (
 )
 
 logger = logging.getLogger(__name__)
+_ACTION_NDIM = 2
+_BATCHED_ACTION_NDIM = 3
 
 
 @export_config(class_path="physicalai.inference.RemoteInferenceModel")
@@ -62,6 +65,12 @@ class RemoteInferenceModel(InferenceModel):
         max_image_side: int | None = None,
         zenoh_config: str | Path | None = None,
     ) -> None:
+        """Initialize a proxy without opening a network session.
+
+        Raises:
+            TypeError: If an expected policy identity has the wrong type.
+            ValueError: If a name, address, timeout, or image option is invalid.
+        """
         self._key_prefix = model_key_prefix(name)
         if (
             isinstance(request_timeout_s, bool)
@@ -69,19 +78,29 @@ class RemoteInferenceModel(InferenceModel):
             or request_timeout_s <= 0
             or int(request_timeout_s * 1000) < 1
         ):
-            raise ValueError("request_timeout_s must be finite and at least 0.001 seconds")
-        if image_codec not in ("jpeg", "raw"):
-            raise ValueError("image_codec must be 'jpeg' or 'raw'")
-        if not isinstance(jpeg_quality, int) or isinstance(jpeg_quality, bool) or not 0 <= jpeg_quality <= 100:
-            raise ValueError("jpeg_quality must be between 0 and 100")
+            msg = "request_timeout_s must be finite and at least 0.001 seconds"
+            raise ValueError(msg)
+        if image_codec not in {"jpeg", "raw"}:
+            msg = "image_codec must be 'jpeg' or 'raw'"
+            raise ValueError(msg)
+        if (
+            not isinstance(jpeg_quality, int)
+            or isinstance(jpeg_quality, bool)
+            or not 0 <= jpeg_quality <= MAX_IMAGE_JPEG_QUALITY
+        ):
+            msg = "jpeg_quality must be between 0 and 100"
+            raise ValueError(msg)
         if max_image_side is not None and (
             not isinstance(max_image_side, int) or isinstance(max_image_side, bool) or max_image_side < 1
         ):
-            raise ValueError("max_image_side must be positive")
+            msg = "max_image_side must be positive"
+            raise ValueError(msg)
         if expected_policy is not None and not isinstance(expected_policy, str):
-            raise TypeError("expected_policy must be a string or None")
+            msg = "expected_policy must be a string or None"
+            raise TypeError(msg)
         if expected_manifest_sha256 is not None and not isinstance(expected_manifest_sha256, str):
-            raise TypeError("expected_manifest_sha256 must be a string or None")
+            msg = "expected_manifest_sha256 must be a string or None"
+            raise TypeError(msg)
 
         self._name = name
         self.policy_name = expected_policy or name
@@ -91,7 +110,7 @@ class RemoteInferenceModel(InferenceModel):
         self._expected_policy = expected_policy
         self._expected_manifest_sha256 = expected_manifest_sha256
         self._request_timeout_s = float(request_timeout_s)
-        self._image_codec = image_codec
+        self._image_codec: ImageCodec = image_codec
         self._jpeg_quality = jpeg_quality
         self._max_image_side = max_image_side
         self._zenoh_config_path = Path(zenoh_config) if zenoh_config is not None else None
@@ -122,7 +141,12 @@ class RemoteInferenceModel(InferenceModel):
         self._predict_in_flight = False
 
     def connect(self) -> None:
-        """Open the session, declare queriers, and validate the server handshake."""
+        """Open the session, declare queriers, and validate the server handshake.
+
+        Raises:
+            RemoteInferenceError: If the server fails the handshake.
+            RemoteInferenceUnavailableError: If the server cannot be reached.
+        """
         with self._lock:
             if self._session is not None and self._server_id is not None:
                 return
@@ -149,15 +173,7 @@ class RemoteInferenceModel(InferenceModel):
                         congestion_control=zenoh.CongestionControl.BLOCK,
                         priority=zenoh.Priority.INTERACTIVE_HIGH,
                     )
-                deadline = time.monotonic() + self._request_timeout_s
-                while not self._all_queries_match():
-                    if time.monotonic() >= deadline:
-                        raise RemoteInferenceUnavailableError(
-                            f"Inference server {self._name!r} at host {self._host!r}, port {self._port} is unavailable; is "
-                            f"`physicalai inference serve --name {self._name}` running, and is the SSH tunnel up / "
-                            "address reachable?"
-                        )
-                    time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
+                self._wait_for_server()
                 request = encode_message({"protocol_version": PROTOCOL_VERSION})
                 started = time.monotonic()
                 metadata = self._query_metadata(request)
@@ -188,36 +204,58 @@ class RemoteInferenceModel(InferenceModel):
                 raise
             except Exception as error:
                 self._close_locked()
-                raise RemoteInferenceUnavailableError(
+                msg = (
                     f"Inference server {self._name!r} at host {self._host!r}, port {self._port} is unavailable; "
                     f"is `physicalai inference serve --name {self._name}` running, and is the SSH tunnel up / "
                     f"address reachable? ({error})"
-                ) from error
+                )
+                raise RemoteInferenceUnavailableError(msg) from error
+
+    def _wait_for_server(self) -> None:
+        deadline = time.monotonic() + self._request_timeout_s
+        while not self._all_queries_match():
+            if time.monotonic() >= deadline:
+                msg = (
+                    f"Inference server {self._name!r} at host {self._host!r}, port {self._port} is unavailable; "
+                    f"is `physicalai inference serve --name {self._name}` running, and is the SSH tunnel up / "
+                    "address reachable?"
+                )
+                raise RemoteInferenceUnavailableError(msg)
+            time.sleep(min(0.01, max(0.0, deadline - time.monotonic())))
 
     def __call__(self, inputs: dict[str, np.ndarray | list[str]]) -> dict[str, np.ndarray]:
-        """Run the generic InferenceModel call interface remotely."""
+        """Run the generic InferenceModel call interface remotely.
+
+        Returns:
+            The complete model output map.
+        """
         with self._lock:
             self.connect()
             _, outputs = self._predict(inputs)
             return outputs
 
     def predict_action_chunk(self, observation: dict[str, Any]) -> np.ndarray:
-        """Return a two-dimensional action chunk, stripping a singleton batch."""
+        """Return a two-dimensional action chunk, stripping a singleton batch.
+
+        Raises:
+            RemoteInferenceProtocolError: If the output is missing actions or has an invalid shape.
+        """
         with self._lock:
             self.connect()
             _, outputs = self._predict(observation)
             if ACTION not in outputs:
-                raise RemoteInferenceProtocolError("Remote response has no action output")
+                msg = "Remote response has no action output"
+                raise RemoteInferenceProtocolError(msg)
             actions = outputs[ACTION]
-            if actions.ndim == 3:
+            if actions.ndim == _BATCHED_ACTION_NDIM:
                 if actions.shape[0] != 1:
-                    raise RemoteInferenceProtocolError(
-                        f"Batched action inference requires batch size 1, got {actions.shape[0]}"
-                    )
+                    msg = f"Batched action inference requires batch size 1, got {actions.shape[0]}"
+                    raise RemoteInferenceProtocolError(msg)
                 actions = actions[0]
             actions = np.atleast_2d(actions)
-            if actions.ndim != 2:
-                raise RemoteInferenceProtocolError(f"Expected a 2-D action chunk, got shape {actions.shape}")
+            if actions.ndim != _ACTION_NDIM:
+                msg = f"Expected a 2-D action chunk, got shape {actions.shape}"
+                raise RemoteInferenceProtocolError(msg)
             return actions
 
     def select_action(self, observation: dict[str, Any]) -> np.ndarray:
@@ -242,13 +280,24 @@ class RemoteInferenceModel(InferenceModel):
             self._close_locked()
 
     def __enter__(self) -> Self:
+        """Connect and return this model proxy.
+
+        Returns:
+            The connected proxy.
+        """
         self.connect()
         return self
 
     def __exit__(self, *exc: object) -> None:
+        """Close the proxy when leaving a context manager."""
         self.close()
 
     def __repr__(self) -> str:
+        """Describe the configured address and connection state.
+
+        Returns:
+            A diagnostic representation of this proxy.
+        """
         return (
             f"RemoteInferenceModel(name={self._name!r}, host={self._host!r}, port={self._port!r}, "
             f"connected={self._server_id is not None})"
@@ -301,65 +350,72 @@ class RemoteInferenceModel(InferenceModel):
     def _validate_handshake(self, metadata: dict[str, Any]) -> None:
         version = metadata.get("protocol_version")
         if not isinstance(version, int) or isinstance(version, bool) or version != PROTOCOL_VERSION:
-            raise RemoteInferenceProtocolError(
-                f"Remote protocol version {metadata.get('protocol_version')!r} does not match {PROTOCOL_VERSION}"
-            )
+            msg = f"Remote protocol version {metadata.get('protocol_version')!r} does not match {PROTOCOL_VERSION}"
+            raise RemoteInferenceProtocolError(msg)
         if metadata.get("name") != self._name:
-            raise RemoteInferenceProtocolError(
-                f"Server name {metadata.get('name')!r} does not match requested name {self._name!r}"
-            )
+            msg = f"Server name {metadata.get('name')!r} does not match requested name {self._name!r}"
+            raise RemoteInferenceProtocolError(msg)
         server_id = metadata.get("server_id")
         policy = metadata.get("policy")
         chunk_size = metadata.get("chunk_size")
         rtc = metadata.get("rtc", {})
         if not isinstance(server_id, str) or not server_id:
-            raise RemoteInferenceProtocolError("Server metadata has no server_id")
+            msg = "Server metadata has no server_id"
+            raise RemoteInferenceProtocolError(msg)
         if not isinstance(chunk_size, int) or isinstance(chunk_size, bool) or chunk_size < 1:
-            raise RemoteInferenceProtocolError("Server metadata has an invalid chunk_size")
+            msg = "Server metadata has an invalid chunk_size"
+            raise RemoteInferenceProtocolError(msg)
         if not isinstance(policy, dict) or any(
             not isinstance(policy.get(field), str) for field in ("name", "manifest_sha256", "backend", "device")
         ):
-            raise RemoteInferenceProtocolError("Server metadata has invalid policy identity")
+            msg = "Server metadata has invalid policy identity"
+            raise RemoteInferenceProtocolError(msg)
         if not isinstance(rtc, dict) or not isinstance(rtc.get("supported"), bool):
-            raise RemoteInferenceProtocolError("Server metadata has invalid RTC information")
+            msg = "Server metadata has invalid RTC information"
+            raise RemoteInferenceProtocolError(msg)
         rtc_chunk_size = rtc.get("chunk_size")
         if (
             rtc["supported"]
             and rtc_chunk_size is not None
             and (not isinstance(rtc_chunk_size, int) or isinstance(rtc_chunk_size, bool) or rtc_chunk_size < 1)
         ):
-            raise RemoteInferenceProtocolError("Server metadata has an invalid RTC chunk_size")
+            msg = "Server metadata has an invalid RTC chunk_size"
+            raise RemoteInferenceProtocolError(msg)
         if not isinstance(metadata.get("cameras"), list) or any(
             not isinstance(camera, dict)
             or not isinstance(camera.get("name"), str)
             or not isinstance(camera.get("shape"), list)
             for camera in metadata["cameras"]
         ):
-            raise RemoteInferenceProtocolError("Server metadata has invalid camera information")
+            msg = "Server metadata has invalid camera information"
+            raise RemoteInferenceProtocolError(msg)
         if metadata.get("image_codecs") != ["jpeg", "raw"]:
-            raise RemoteInferenceProtocolError("Server metadata has invalid image codecs")
+            msg = "Server metadata has invalid image codecs"
+            raise RemoteInferenceProtocolError(msg)
         max_request_bytes = metadata.get("max_request_bytes")
         if not isinstance(max_request_bytes, int) or isinstance(max_request_bytes, bool) or max_request_bytes < 1:
-            raise RemoteInferenceProtocolError("Server metadata has invalid max_request_bytes")
+            msg = "Server metadata has invalid max_request_bytes"
+            raise RemoteInferenceProtocolError(msg)
         if self._expected_policy is not None and policy["name"] != self._expected_policy:
-            raise RemoteInferenceModelMismatchError(
-                f"Expected policy {self._expected_policy!r}, got {policy['name']!r}"
-            )
+            msg = f"Expected policy {self._expected_policy!r}, got {policy['name']!r}"
+            raise RemoteInferenceModelMismatchError(msg)
         if self._expected_manifest_sha256 is not None and policy["manifest_sha256"] != self._expected_manifest_sha256:
-            raise RemoteInferenceModelMismatchError("Remote manifest SHA-256 does not match the expected value")
+            msg = "Remote manifest SHA-256 does not match the expected value"
+            raise RemoteInferenceModelMismatchError(msg)
 
     def _query_metadata(self, payload: bytes) -> dict[str, Any]:
         reply = self._receive_matching_reply("metadata", payload, None)
         if reply.err is not None:
             self._raise_remote_error(bytes(reply.err.payload), None)
         if reply.ok is None:
-            raise RemoteInferenceProtocolError("Metadata query returned an empty reply")
-        metadata = decode_message(bytes(reply.ok.payload))
-        return metadata
+            msg = "Metadata query returned an empty reply"
+            raise RemoteInferenceProtocolError(msg)
+        return decode_message(bytes(reply.ok.payload))
 
     def _predict(self, inputs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
         if self._predict_in_flight:
-            raise RemoteInferenceError("A prediction request is already in flight for this client")
+            msg = "A prediction request is already in flight for this client"
+            raise RemoteInferenceError(msg)
         self._predict_in_flight = True
         try:
             self._last_timing = None
@@ -380,7 +436,8 @@ class RemoteInferenceModel(InferenceModel):
             if reply.err is not None:
                 self._raise_remote_error(bytes(reply.err.payload), seq)
             if reply.ok is None:
-                raise RemoteInferenceProtocolError("Prediction query returned an empty reply")
+                msg = "Prediction query returned an empty reply"
+                raise RemoteInferenceProtocolError(msg)
             reply_payload = bytes(reply.ok.payload)
             decode_started = time.perf_counter()
             metadata = decode_predict_reply(reply_payload)
@@ -400,31 +457,35 @@ class RemoteInferenceModel(InferenceModel):
         finally:
             self._predict_in_flight = False
 
-    def _receive_matching_reply(self, name: str, payload: bytes, seq: int | None) -> Any:
+    def _receive_matching_reply(self, name: str, payload: bytes, seq: int | None) -> zenoh.Reply:
         if self._session is None:
-            raise RemoteInferenceUnavailableError("Remote inference session is not connected")
+            msg = "Remote inference session is not connected"
+            raise RemoteInferenceUnavailableError(msg)
         querier = self._queriers.get(name)
         if querier is None:
-            raise RemoteInferenceUnavailableError(f"Remote inference querier {name!r} is not declared")
+            msg = f"Remote inference querier {name!r} is not declared"
+            raise RemoteInferenceUnavailableError(msg)
         receiver = querier.get(payload=payload)
         while True:
             try:
                 reply = receiver.recv()
             except Exception as error:
                 if "timeout" in str(error).lower():
-                    raise RemoteInferenceTimeoutError(
-                        f"Remote inference request {seq} timed out after {self._request_timeout_s:.3f}s"
-                    ) from error
-                raise RemoteInferenceUnavailableError(f"Remote inference query failed: {error}") from error
+                    msg = f"Remote inference request {seq} timed out after {self._request_timeout_s:.3f}s"
+                    raise RemoteInferenceTimeoutError(msg) from error
+                msg = f"Remote inference query failed: {error}"
+                raise RemoteInferenceUnavailableError(msg) from error
             if reply is None:
-                raise RemoteInferenceTimeoutError(f"Remote inference request {seq} timed out")
+                msg = f"Remote inference request {seq} timed out"
+                raise RemoteInferenceTimeoutError(msg)
             if reply.err is not None:
                 error_payload = bytes(reply.err.payload)
                 if error_payload.strip().lower() == b"timeout":
-                    raise RemoteInferenceTimeoutError(
+                    msg = (
                         f"Remote inference request {seq if seq is not None else name} timed out "
                         f"after {self._request_timeout_s:.3f}s"
                     )
+                    raise RemoteInferenceTimeoutError(msg)
                 error_metadata = decode_error(error_payload)
                 if seq is not None and error_metadata.get("seq") != seq:
                     continue
@@ -440,51 +501,68 @@ class RemoteInferenceModel(InferenceModel):
         version = metadata.get("protocol_version")
         response_seq = metadata.get("seq")
         if not isinstance(version, int) or isinstance(version, bool) or version != PROTOCOL_VERSION:
-            raise RemoteInferenceProtocolError("Prediction response protocol version mismatch")
+            msg = "Prediction response protocol version mismatch"
+            raise RemoteInferenceProtocolError(msg)
         if not isinstance(response_seq, int) or isinstance(response_seq, bool) or response_seq != seq:
-            raise RemoteInferenceProtocolError("Prediction response sequence mismatch")
+            msg = "Prediction response sequence mismatch"
+            raise RemoteInferenceProtocolError(msg)
         for field in ("server_queue_s", "server_compute_s"):
             value = metadata.get(field)
             if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
-                raise RemoteInferenceProtocolError(f"Prediction response has invalid {field}")
+                msg = f"Prediction response has invalid {field}"
+                raise RemoteInferenceProtocolError(msg)
         server_id = metadata.get("server_id")
         if not isinstance(server_id, str) or server_id != self._server_id:
-            raise RemoteInferenceModelMismatchError("Inference server restarted or was replaced")
+            msg = "Inference server restarted or was replaced"
+            raise RemoteInferenceModelMismatchError(msg)
 
     def _send(self, name: str, payload: bytes, seq: int | None) -> dict[str, Any]:
         reply = self._receive_matching_reply(name, payload, seq)
         if reply.err is not None:
             self._raise_remote_error(bytes(reply.err.payload), seq)
         if reply.ok is None:
-            raise RemoteInferenceProtocolError("Remote request returned an empty reply")
+            msg = "Remote request returned an empty reply"
+            raise RemoteInferenceProtocolError(msg)
         response = decode_message(bytes(reply.ok.payload))
         if response != {"protocol_version": PROTOCOL_VERSION, "ok": True}:
-            raise RemoteInferenceProtocolError("Invalid reset response")
+            msg = "Invalid reset response"
+            raise RemoteInferenceProtocolError(msg)
         return response
 
-    def _raise_remote_error(self, payload: bytes, seq: int | None) -> None:
+    @staticmethod
+    def _raise_remote_error(payload: bytes, seq: int | None) -> None:
         metadata = decode_error(payload)
         if metadata.get("protocol_version") != PROTOCOL_VERSION:
-            raise RemoteInferenceProtocolError("Remote error protocol version mismatch")
+            msg = "Remote error protocol version mismatch"
+            raise RemoteInferenceProtocolError(msg)
         error_seq = metadata.get("seq")
         if not isinstance(error_seq, int) or isinstance(error_seq, bool):
-            raise RemoteInferenceProtocolError("Remote error has an invalid sequence")
+            msg = "Remote error has an invalid sequence"
+            raise RemoteInferenceProtocolError(msg)
         if seq is not None and error_seq != seq:
-            raise RemoteInferenceProtocolError("Remote error sequence mismatch")
+            msg = "Remote error sequence mismatch"
+            raise RemoteInferenceProtocolError(msg)
         code = metadata.get("code")
         if code == "expired":
-            raise RemoteInferenceTimeoutError(f"Remote inference request {seq} expired in the server queue")
+            msg = f"Remote inference request {seq} expired in the server queue"
+            raise RemoteInferenceTimeoutError(msg)
         if code == "unsupported_version":
-            raise RemoteInferenceProtocolError("Remote server does not support this protocol version")
+            msg = "Remote server does not support this protocol version"
+            raise RemoteInferenceProtocolError(msg)
         if code == "invalid_request":
-            raise RemoteInferenceProtocolError("Remote server rejected the request as invalid")
+            msg = "Remote server rejected the request as invalid"
+            raise RemoteInferenceProtocolError(msg)
         if code == "shutting_down":
-            raise RemoteInferenceUnavailableError("Remote inference server is shutting down")
+            msg = "Remote inference server is shutting down"
+            raise RemoteInferenceUnavailableError(msg)
         if code == "superseded":
-            raise RemoteInferenceError(f"Remote inference request {seq} was superseded by a newer request")
+            msg = f"Remote inference request {seq} was superseded by a newer request"
+            raise RemoteInferenceError(msg)
         if code == "model_error":
-            raise RemoteInferenceError("Remote model failed to process the request")
-        raise RemoteInferenceProtocolError(f"Unknown remote error code: {code!r}")
+            msg = "Remote model failed to process the request"
+            raise RemoteInferenceError(msg)
+        msg = f"Unknown remote error code: {code!r}"
+        raise RemoteInferenceProtocolError(msg)
 
     def _next_seq(self) -> int:
         self._seq += 1
