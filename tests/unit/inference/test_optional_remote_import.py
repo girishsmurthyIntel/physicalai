@@ -8,6 +8,31 @@ import sys
 import textwrap
 
 
+def test_cli_and_robot_codec_import_without_msgpack() -> None:
+    script = textwrap.dedent(
+        """
+        import builtins
+
+        original_import = builtins.__import__
+
+        def block_msgpack(name, *args, **kwargs):
+            if name == "msgpack" or name.startswith("msgpack."):
+                raise ModuleNotFoundError("simulated missing optional msgpack dependency")
+            return original_import(name, *args, **kwargs)
+
+        builtins.__import__ = block_msgpack
+        import physicalai.cli.main
+        import physicalai.cli.robot
+        from physicalai.robot.transport import _codec
+
+        assert _codec.ROBOT_TRANSPORT_PROTOCOL_VERSION == 1
+        """
+    )
+    result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)
+
+    assert result.returncode == 0, result.stderr
+
+
 def test_inference_package_imports_without_zenoh() -> None:
     script = textwrap.dedent(
         """

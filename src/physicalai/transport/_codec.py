@@ -8,7 +8,6 @@ from __future__ import annotations
 import math
 from typing import Any
 
-import msgpack
 import numpy as np
 
 DEFAULT_MAX_PAYLOAD_BYTES = 32 * 2**20
@@ -49,6 +48,8 @@ def msgpack_default(value: object) -> object:
 
 def pack_msgpack(payload: object) -> bytes:
     """Pack a value using binary-safe MessagePack and the shared NumPy encoder."""
+    import msgpack  # noqa: PLC0415
+
     return msgpack.packb(payload, default=msgpack_default, use_bin_type=True)
 
 
@@ -131,6 +132,8 @@ def unpack_msgpack(
     max_depth: int = DEFAULT_MAX_PAYLOAD_DEPTH,
 ) -> object:
     """Unpack and safely decode a MessagePack payload before NumPy allocation."""
+    import msgpack  # noqa: PLC0415
+
     if len(data) > max_bytes:
         raise ValueError(f"MessagePack payload of {len(data)} bytes exceeds the {max_bytes}-byte limit")
     try:
