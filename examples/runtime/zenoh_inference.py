@@ -17,10 +17,10 @@ Usage examples:
   uv run python examples/runtime/zenoh_inference.py --mode loopback --requests 50 --chunk-size 32
 
     # 3. Dedicated server mode (serves one model namespace):
-  uv run python examples/runtime/zenoh_inference.py --mode server --endpoint tcp/127.0.0.1:7447
+    uv run python examples/runtime/zenoh_inference.py --mode server --host 127.0.0.1 --port 7447
 
   # 4. Dedicated client mode:
-  uv run python examples/runtime/zenoh_inference.py --mode client --endpoint tcp/127.0.0.1:7447
+    uv run python examples/runtime/zenoh_inference.py --mode client --host 127.0.0.1 --port 7447
 """
 
 from __future__ import annotations
@@ -40,7 +40,6 @@ from physicalai.runtime import (
     RTCExecution,
     SyncExecution,
 )
-from physicalai.transport._zenoh import endpoint_for_key, model_key_prefix
 
 
 class SyntheticInferenceModel:
@@ -80,8 +79,7 @@ def make_sample_observation(image_h: int = 224, image_w: int = 224, joint_dim: i
 
 def run_server(
     model_name: str,
-    endpoint: str | None,
-    listen_host: str,
+    host: str,
     server_port: int | None,
     allow_all_interfaces: bool,
     simulated_latency_ms: float,
@@ -92,16 +90,16 @@ def run_server(
         chunk_size=chunk_size,
         simulated_inference_s=simulated_latency_ms / 1000.0,
     )
-    listen = endpoint or endpoint_for_key(model_key_prefix(model_name), listen_host, server_port)
     server = InferenceServer(
         model=model,  # type: ignore[arg-type]
         name=model_name,
-        listen=listen,
+        host=host,
+        port=server_port,
         allow_all_interfaces=allow_all_interfaces,
     )
     try:
         server.start()
-        print(f"[Server] Listening on endpoint: {server.endpoint}")
+        print(f"[Server] Listening on {server.host}, port {server.port}")
         print("[Server] Server is running. Press Ctrl+C to terminate.")
         server.serve_forever()
     except KeyboardInterrupt:
@@ -113,22 +111,20 @@ def run_server(
 
 def run_client(
     model_name: str,
-    endpoint: str | None,
-    server_host: str,
+    host: str,
     server_port: int | None,
     execution_mode: str,
     num_requests: int,
     warmup_requests: int,
     startup_timeout_s: float = 0.0,
 ) -> None:
-    remote_endpoint = endpoint or endpoint_for_key(model_key_prefix(model_name), server_host, server_port)
-    print(f"[Client] Connecting to model '{model_name}' at {remote_endpoint}...")
-
     model = RemoteInferenceModel(
         name=model_name,
-        endpoint=remote_endpoint,
+        host=host,
+        port=server_port,
         request_timeout_s=2.0,
     )
+    print(f"[Client] Connecting to model '{model_name}' at {model.host}, port {model.port}...")
     deadline = time.monotonic() + startup_timeout_s
     while True:
         try:
@@ -227,13 +223,12 @@ def run_loopback(
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
-    endpoint = f"tcp/127.0.0.1:{port}"
-    print(f"[Loopback] Setting up model '{model_name}' on {endpoint}...")
+    print(f"[Loopback] Setting up model '{model_name}' on 127.0.0.1, port {port}...")
     model = SyntheticInferenceModel(chunk_size=chunk_size, simulated_inference_s=simulated_latency_ms / 1000.0)
     server = InferenceServer(
         model=model,
         name=model_name,
-        listen=endpoint,
+        port=port,
     )  # type: ignore[arg-type]
 
     server.start()
@@ -243,8 +238,7 @@ def run_loopback(
     try:
         run_client(
             model_name=model_name,
-            endpoint=endpoint,
-            server_host="127.0.0.1",
+            host="127.0.0.1",
             server_port=port,
             execution_mode=execution_mode,
             num_requests=requests,
@@ -281,19 +275,9 @@ def main() -> None:
         help="Scheduling strategy used with the same remote model",
     )
     parser.add_argument(
-        "--endpoint",
-        default=None,
-        help="Explicit Zenoh endpoint override; otherwise the port is derived from --model-name",
-    )
-    parser.add_argument(
-        "--server-host",
+        "--host",
         default="127.0.0.1",
-        help="Server host to connect to in client mode",
-    )
-    parser.add_argument(
-        "--listen-host",
-        default="127.0.0.1",
-        help="Loopback host to bind in server mode (default: 127.0.0.1)",
+        help="Server hostname or IP address to bind or connect to",
     )
     parser.add_argument(
         "--allow-all-interfaces",
@@ -336,8 +320,7 @@ def main() -> None:
     if args.mode == "server":
         run_server(
             model_name=args.model_name,
-            endpoint=args.endpoint,
-            listen_host=args.listen_host,
+            host=args.host,
             server_port=args.port,
             allow_all_interfaces=args.allow_all_interfaces,
             simulated_latency_ms=args.simulated_latency_ms,
@@ -346,8 +329,7 @@ def main() -> None:
     elif args.mode == "client":
         run_client(
             model_name=args.model_name,
-            endpoint=args.endpoint,
-            server_host=args.server_host,
+            host=args.host,
             server_port=args.port,
             execution_mode=args.execution_mode,
             num_requests=args.requests,

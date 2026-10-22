@@ -85,3 +85,25 @@ observation = {
 ```
 
 The expected keys and shapes come from the exported package and its preprocessing pipeline.
+
+## Remote Inference
+
+```python
+from physicalai.inference import RemoteInferenceModel
+from physicalai.inference.remote import InferenceServer
+
+server = InferenceServer(model, name="cell1-act", host="127.0.0.1")
+client = RemoteInferenceModel(name="cell1-act", host="127.0.0.1")
+```
+
+Both constructors accept keyword-only `host` (default `127.0.0.1`) and `port`
+(default `None`). Omitting `port` derives the same deterministic TCP port from
+`name` on both sides. Set an explicit port on both constructors to override it.
+Read-only `host` and `port` properties expose the configured host and resolved
+port. Zenoh endpoint strings are internal, not constructor arguments or public
+properties.
+
+`InferenceServer` requires `allow_all_interfaces=True` for a non-loopback host;
+that flag does not change the configured host. See
+[Run Inference Remotely](../how-to/runtime/run-inference-remotely.md) for server
+lifecycle, CLI, SSH tunneling, and deployment configuration.

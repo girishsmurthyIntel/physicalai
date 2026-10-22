@@ -75,22 +75,40 @@ class _Model:
         return {ACTION: self.predict_action_chunk(inputs)}
 
 
-def _free_endpoint() -> str:
+def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         port = sock.getsockname()[1]
-    return f"tcp/127.0.0.1:{port}"
+    return port
+
+
+@pytest.mark.parametrize("host", ["127.0.0.1", "localhost", "::1"])
+@pytest.mark.parametrize("port", [None, 23456])
+def test_public_api_uses_host_and_optional_port(host: str, port: int | None) -> None:
+    name = "host-port-api"
+    server = InferenceServer(_Model(name), name, host=host, port=port)
+    client = RemoteInferenceModel(name, host=host, port=port)
+    expected_endpoint = endpoint_for_key(model_key_prefix(name), host, port)
+
+    assert server.host == client.host == host
+    assert server.port == client.port == int(expected_endpoint.rsplit(":", 1)[1])
+    assert server._listen == client._endpoint == expected_endpoint
+    assert not hasattr(server, "endpoint")
+    assert not hasattr(server, "listen_endpoint")
+    assert not hasattr(client, "endpoint")
+    assert "endpoint" not in inspect.signature(RemoteInferenceModel).parameters
+    assert "listen" not in inspect.signature(InferenceServer).parameters
 
 
 def test_client_rejects_server_with_different_expected_policy() -> None:
     model_b = _Model("model-b")
-    endpoint_b = _free_endpoint()
-    server_b = InferenceServer(model_b, "model-b", listen=endpoint_b)
+    port_b = _free_port()
+    server_b = InferenceServer(model_b, "model-b", port=port_b)
     server_b.start()
     assert len(server_b._queryables) == 3  # noqa: SLF001
     mismatched_client = RemoteInferenceModel(
         "model-b",
-        endpoint=endpoint_b,
+        port=port_b,
         expected_policy="another-policy",
         request_timeout_s=0.5,
     )
@@ -99,7 +117,7 @@ def test_client_rejects_server_with_different_expected_policy() -> None:
         mismatched_client.connect()
     mismatched_client.close()
 
-    client_for_b = RemoteInferenceModel("model-b", endpoint=endpoint_b)
+    client_for_b = RemoteInferenceModel("model-b", port=port_b)
     try:
         actions = client_for_b.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
         assert actions.shape == (4, 3)
@@ -122,19 +140,19 @@ def test_client_accepts_matching_policy_and_manifest_pins(tmp_path: Any) -> None
     model = _Model("pi05")
     model.export_dir = tmp_path
     model.manifest.policy = SimpleNamespace(name="pi05")
-    endpoint = _free_endpoint()
-    server = InferenceServer(model, "cell1-act", listen=endpoint)
+    port = _free_port()
+    server = InferenceServer(model, "cell1-act", port=port)
     server.start()
     correct_hash = hashlib.sha256(manifest_bytes).hexdigest()
     matching = RemoteInferenceModel(
         "cell1-act",
-        endpoint=endpoint,
+        port=port,
         expected_policy="pi05",
         expected_manifest_sha256=correct_hash,
     )
     wrong_hash = RemoteInferenceModel(
         "cell1-act",
-        endpoint=endpoint,
+        port=port,
         expected_manifest_sha256="0" * 64,
     )
     try:
@@ -154,9 +172,9 @@ def test_server_error_reply_does_not_expose_exception_text() -> None:
             raise RuntimeError("private model failure details")
 
     name = "error-reply-test"
-    server = InferenceServer(_FailingModel(name), name, listen=_free_endpoint())
+    server = InferenceServer(_FailingModel(name), name, port=_free_port())
     server.start()
-    client = RemoteInferenceModel(name, endpoint=server.endpoint, request_timeout_s=0.5)
+    client = RemoteInferenceModel(name, port=server.port, request_timeout_s=0.5)
     try:
         with pytest.raises(RemoteInferenceError) as error:
             client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
@@ -177,9 +195,9 @@ def test_task_remains_a_string_list_through_the_model_preprocessor() -> None:
 
     name = "task-list-preprocessor"
     model = _TaskCheckingModel(name)
-    server = InferenceServer(model, name, listen=_free_endpoint())
+    server = InferenceServer(model, name, port=_free_port())
     server.start()
-    client = RemoteInferenceModel(name, endpoint=server.endpoint)
+    client = RemoteInferenceModel(name, port=server.port)
     try:
         outputs = client({"task": ["pick red"]})
         assert outputs[ACTION].shape == (1, 4, 3)
@@ -191,9 +209,9 @@ def test_task_remains_a_string_list_through_the_model_preprocessor() -> None:
 
 def test_live_server_returns_invalid_request_without_exception_text() -> None:
     name = "invalid-request-live"
-    server = InferenceServer(_Model(name), name, listen=_free_endpoint(), max_request_bytes=1024)
+    server = InferenceServer(_Model(name), name, port=_free_port(), max_request_bytes=1024)
     server.start()
-    client = RemoteInferenceModel(name, endpoint=server.endpoint)
+    client = RemoteInferenceModel(name, port=server.port)
     malformed_payloads = [
         encode_message({
             "protocol_version": 1,
@@ -232,13 +250,13 @@ def test_two_server_namespaces_are_isolated_after_one_server_stops() -> None:
         def __call__(self, inputs: dict[str, Any]) -> dict[str, np.ndarray]:
             return {ACTION: np.full((1, self.chunk_size, 2), self.value, dtype=np.float32)}
 
-    endpoint_a, endpoint_b = _free_endpoint(), _free_endpoint()
-    server_a = InferenceServer(_ValueModel(11.0, 3), "cell1-act", listen=endpoint_a)
-    server_b = InferenceServer(_ValueModel(22.0, 5), "cell2-act", listen=endpoint_b)
+    port_a, port_b = _free_port(), _free_port()
+    server_a = InferenceServer(_ValueModel(11.0, 3), "cell1-act", port=port_a)
+    server_b = InferenceServer(_ValueModel(22.0, 5), "cell2-act", port=port_b)
     server_a.start()
     server_b.start()
-    client_a = RemoteInferenceModel("cell1-act", endpoint=endpoint_a, request_timeout_s=0.2)
-    client_b = RemoteInferenceModel("cell2-act", endpoint=endpoint_b, request_timeout_s=0.2)
+    client_a = RemoteInferenceModel("cell1-act", port=port_a, request_timeout_s=0.2)
+    client_b = RemoteInferenceModel("cell2-act", port=port_b, request_timeout_s=0.2)
     try:
         actions_a = client_a.predict_action_chunk({"state": np.zeros(2, dtype=np.float32)})
         actions_b = client_b.predict_action_chunk({"state": np.zeros(2, dtype=np.float32)})
@@ -261,9 +279,9 @@ def test_two_server_namespaces_are_isolated_after_one_server_stops() -> None:
 
 def test_two_servers_with_same_name_cannot_bind_the_same_port() -> None:
     name = "same-slot-collision"
-    endpoint = _free_endpoint()
-    first = InferenceServer(_Model("pi05"), name, listen=endpoint)
-    second = InferenceServer(_Model("pi05"), name, listen=endpoint)
+    port = _free_port()
+    first = InferenceServer(_Model("pi05"), name, port=port)
+    second = InferenceServer(_Model("pi05"), name, port=port)
     first.start()
     try:
         with pytest.raises(Exception, match="Address already in use"):
@@ -275,7 +293,7 @@ def test_two_servers_with_same_name_cannot_bind_the_same_port() -> None:
 
 
 def test_client_rejects_protocol_version_mismatch() -> None:
-    client = RemoteInferenceModel("version-mismatch", endpoint="tcp/127.0.0.1:12346")
+    client = RemoteInferenceModel("version-mismatch", port=12346)
 
     with pytest.raises(RemoteInferenceProtocolError, match="protocol version"):
         client._validate_handshake({"protocol_version": 2})  # noqa: SLF001
@@ -283,17 +301,17 @@ def test_client_rejects_protocol_version_mismatch() -> None:
 
 def test_client_detects_server_restart_during_run() -> None:
     name = "restart-detection"
-    endpoint = _free_endpoint()
-    first_server = InferenceServer(_Model("pi05"), name, listen=endpoint)
+    port = _free_port()
+    first_server = InferenceServer(_Model("pi05"), name, port=port)
     first_server.start()
-    client = RemoteInferenceModel(name, endpoint=endpoint, request_timeout_s=1.0)
+    client = RemoteInferenceModel(name, port=port, request_timeout_s=1.0)
     second_server: InferenceServer | None = None
     try:
         client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
         first_id = client.metadata["server_id"]
         first_server.stop()
 
-        second_server = InferenceServer(_Model("pi05"), name, listen=endpoint)
+        second_server = InferenceServer(_Model("pi05"), name, port=port)
         second_server.start()
         assert second_server._server_id != first_id  # noqa: SLF001
         assert _wait_until(client._all_queries_match, 2.0)  # noqa: SLF001
@@ -345,10 +363,10 @@ def test_server_serializes_predict_and_reset_on_its_model_worker() -> None:
 
     name = "serialized-model"
     model = _ConcurrentModel()
-    server = InferenceServer(model, name, listen=_free_endpoint())
+    server = InferenceServer(model, name, port=_free_port())
     server.start()
-    predict_client = RemoteInferenceModel(name, endpoint=server.endpoint, request_timeout_s=1.0)
-    reset_client = RemoteInferenceModel(name, endpoint=server.endpoint, request_timeout_s=1.0)
+    predict_client = RemoteInferenceModel(name, port=server.port, request_timeout_s=1.0)
+    reset_client = RemoteInferenceModel(name, port=server.port, request_timeout_s=1.0)
     errors: list[BaseException] = []
 
     def predict() -> None:
@@ -412,7 +430,7 @@ def test_predict_timeout_is_typed_and_not_retried(monkeypatch: pytest.MonkeyPatc
             self.get_count += 1
             return _TimeoutReceiver()
 
-    client = RemoteInferenceModel("no-retry", endpoint="tcp/127.0.0.1:14570", request_timeout_s=0.05)
+    client = RemoteInferenceModel("no-retry", port=14570, request_timeout_s=0.05)
     querier = _Querier()
     client._session = object()  # noqa: SLF001
     client._server_id = "test-server"  # noqa: SLF001
@@ -438,7 +456,7 @@ def test_server_name_follows_policy_pattern_without_an_arbitrary_length_limit() 
 
 
 def test_server_name_mismatch_is_not_reported_as_model_identity_mismatch() -> None:
-    client = RemoteInferenceModel("cell1-act", endpoint="tcp/127.0.0.1:12345")
+    client = RemoteInferenceModel("cell1-act", port=12345)
 
     with pytest.raises(RemoteInferenceProtocolError, match="Server name"):
         client._validate_handshake(  # noqa: SLF001
@@ -599,31 +617,34 @@ def test_predict_reply_preserves_the_full_model_output_map() -> None:
     np.testing.assert_array_equal(decoded["outputs"]["aux"], outputs["aux"])
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "[::]", "100.64.0.10", "192.168.1.20"])
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "100.64.0.10", "192.168.1.20"])
 def test_non_loopback_listeners_require_opt_in(host: str) -> None:
     with pytest.raises(ValueError, match="allow_all_interfaces"):
-        InferenceServer(_Model("listener-security"), "listener-security", listen=f"tcp/{host}:5555")
+        InferenceServer(_Model("listener-security"), "listener-security", host=host, port=5555)
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "[::]", "100.64.0.10", "192.168.1.20", ""])
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "100.64.0.10", "192.168.1.20"])
 def test_non_loopback_listeners_are_allowed_with_explicit_opt_in(host: str) -> None:
     server = InferenceServer(
         _Model("listener-opt-in"),
         "listener-opt-in",
-        listen=f"tcp/{host}:5555",
+        host=host,
+        port=5555,
         allow_all_interfaces=True,
     )
 
-    assert server.endpoint == f"tcp/{host}:5555"
+    assert server.host == host
+    assert server.port == 5555
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "[::]", "100.64.0.10", "192.168.1.20"])
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "100.64.0.10", "192.168.1.20"])
 def test_non_loopback_listener_logs_unauthenticated_exposure_warning(
     host: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING, logger="physicalai.inference.remote.server"):
-        InferenceServer._warn_non_loopback_listener(f"tcp/{host}:5555")  # noqa: SLF001
+        server = InferenceServer(_Model("warning"), "warning", host=host, port=5555, allow_all_interfaces=True)
+        server._warn_non_loopback_listener()  # noqa: SLF001
 
     assert "inference server reachable at :5555 without Zenoh-level authentication" in caplog.text
     assert "use only on a trusted network or tailnet" in caplog.text
@@ -634,10 +655,11 @@ def test_client_constructor_is_lazy_and_exports_its_public_config_path(monkeypat
         raise AssertionError("constructor must not open a Zenoh session")
 
     monkeypatch.setattr(client_module, "open_zenoh_session", fail_if_opened)
-    model = RemoteInferenceModel("lazy-construction", endpoint="tcp/127.0.0.1:14567")
+    model = RemoteInferenceModel("lazy-construction", host="localhost", port=14567)
 
     assert not hasattr(model, "manifest")
-    assert model.endpoint == "tcp/127.0.0.1:14567"
+    assert model.host == "localhost"
+    assert model.port == 14567
     assert model.metadata == {}
 
     from physicalai.config import Config
@@ -648,6 +670,8 @@ def test_client_constructor_is_lazy_and_exports_its_public_config_path(monkeypat
     assert recipe.class_path == "physicalai.inference.RemoteInferenceModel"
     restored = recipe.instantiate(expected_type=InferenceModel)
     assert isinstance(restored, InferenceModel)
+    assert restored.host == model.host
+    assert restored.port == model.port
     assert not hasattr(restored, "manifest")
     source_recipe = Config.from_instance(PolicySource(model=model))
     restored_source = source_recipe.instantiate()
@@ -686,7 +710,7 @@ def test_default_client_config_sets_one_connect_and_no_listen_endpoint(monkeypat
         return _Config()
 
     monkeypatch.setattr(client_module, "make_zenoh_config", capture_config)
-    RemoteInferenceModel("client-config", endpoint="tcp/192.0.2.1:45000")
+    RemoteInferenceModel("client-config", host="192.0.2.1", port=45000)
 
     assert captured == {
         "mode": "client",
@@ -717,7 +741,7 @@ def test_default_server_config_uses_peer_mode_and_one_listen_endpoint(monkeypatc
     assert captured == {
         "mode": "peer",
         "connect_endpoints": [],
-        "listen_endpoints": [server.endpoint],
+        "listen_endpoints": [server._listen],
         "multicast_enabled": False,
         "gossip_enabled": False,
     }
@@ -725,7 +749,7 @@ def test_default_server_config_uses_peer_mode_and_one_listen_endpoint(monkeypatc
 
 
 def test_client_fails_unavailable_when_no_queryable_matches() -> None:
-    model = RemoteInferenceModel("unavailable-test", endpoint=_free_endpoint(), request_timeout_s=0.05)
+    model = RemoteInferenceModel("unavailable-test", port=_free_port(), request_timeout_s=0.05)
 
     with pytest.raises(RemoteInferenceError, match="SSH tunnel up / address reachable"):
         model.connect()
@@ -820,9 +844,9 @@ def test_live_newest_wins_supersedes_pending_request_while_worker_is_busy() -> N
 
     name = "newest-wins-live"
     model = _BlockingModel()
-    server = InferenceServer(model, name, listen=_free_endpoint())
+    server = InferenceServer(model, name, port=_free_port())
     server.start()
-    clients = [RemoteInferenceModel(name, endpoint=server.endpoint, request_timeout_s=3.0) for _ in range(3)]
+    clients = [RemoteInferenceModel(name, port=server.port, request_timeout_s=3.0) for _ in range(3)]
     results: dict[str, np.ndarray] = {}
     errors: dict[str, BaseException] = {}
     completed = {key: threading.Event() for key in ("running", "pending", "newest")}
@@ -905,16 +929,16 @@ def test_server_and_client_derive_port_from_model_namespace() -> None:
     server = InferenceServer(_Model(model_name), model_name)
     client = RemoteInferenceModel(model_name)
 
-    assert server.endpoint == endpoint_for_key(key_prefix, "127.0.0.1")
-    assert client.endpoint == endpoint_for_key(key_prefix, "127.0.0.1")
+    assert server.host == client.host == "127.0.0.1"
+    assert server.port == client.port == int(endpoint_for_key(key_prefix, "127.0.0.1").rsplit(":", 1)[1])
 
 
 def test_reset_roundtrip_runs_on_the_server_worker() -> None:
     name = "reset-roundtrip"
     model = _Model(name)
-    server = InferenceServer(model, name, listen=_free_endpoint())
+    server = InferenceServer(model, name, port=_free_port())
     server.start()
-    client = RemoteInferenceModel(name, endpoint=server.endpoint)
+    client = RemoteInferenceModel(name, port=server.port)
     try:
         client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
         client.reset()
@@ -927,9 +951,9 @@ def test_reset_roundtrip_runs_on_the_server_worker() -> None:
 
 def test_predict_querier_can_be_reused() -> None:
     name = "repeat-predict"
-    server = InferenceServer(_Model(name), name, listen=_free_endpoint())
+    server = InferenceServer(_Model(name), name, port=_free_port())
     server.start()
-    client = RemoteInferenceModel(name, endpoint=server.endpoint)
+    client = RemoteInferenceModel(name, port=server.port)
     try:
         for _ in range(3):
             assert client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)}).shape == (4, 3)
@@ -942,9 +966,9 @@ def test_client_uses_rtc_chunk_size_from_handshake_without_manifest() -> None:
     name = "rtc-handshake"
     model = _Model(name)
     model.manifest.model_extra["rtc"] = {"chunk_size": 6}
-    server = InferenceServer(model, name, listen=_free_endpoint())
+    server = InferenceServer(model, name, port=_free_port())
     server.start()
-    client = RemoteInferenceModel(name, endpoint=server.endpoint)
+    client = RemoteInferenceModel(name, port=server.port)
     try:
         assert client.chunk_size == 6
         assert not hasattr(client, "manifest")
@@ -1017,7 +1041,7 @@ def test_client_uses_reliable_best_matching_queriers_for_all_requests(monkeypatc
             pass
 
     monkeypatch.setattr(client_module, "open_zenoh_session", lambda *_args, **_kwargs: _Session())
-    client = RemoteInferenceModel(name, endpoint="tcp/127.0.0.1:14568", request_timeout_s=0.5)
+    client = RemoteInferenceModel(name, port=14568, request_timeout_s=0.5)
     try:
         client.connect()
         actions = client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
@@ -1049,7 +1073,7 @@ def test_client_uses_reliable_best_matching_queriers_for_all_requests(monkeypatc
 
 
 def test_client_predict_guard_rejects_overlapping_in_flight_request() -> None:
-    client = RemoteInferenceModel("in-flight-guard", endpoint="tcp/127.0.0.1:14569")
+    client = RemoteInferenceModel("in-flight-guard", port=14569)
     client._predict_in_flight = True  # noqa: SLF001
 
     with pytest.raises(RemoteInferenceError, match="already in flight"):
@@ -1062,9 +1086,9 @@ def test_client_rejects_action_batch_larger_than_one() -> None:
             return {ACTION: np.ones((2, 4, 3), dtype=np.float32)}
 
     name = "batched-actions"
-    server = InferenceServer(_BatchedModel(name), name, listen=_free_endpoint())
+    server = InferenceServer(_BatchedModel(name), name, port=_free_port())
     server.start()
-    client = RemoteInferenceModel(name, endpoint=server.endpoint)
+    client = RemoteInferenceModel(name, port=server.port)
     try:
         with pytest.raises(RemoteInferenceProtocolError, match="batch size 1"):
             client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
@@ -1114,9 +1138,9 @@ def test_remote_policy_source_runs_fifty_fake_robot_ticks(mode: str) -> None:
 
     name = f"fifty-ticks-{mode}"
     served_model = _Model(name)
-    server = InferenceServer(served_model, name, listen=_free_endpoint())
+    server = InferenceServer(served_model, name, port=_free_port())
     server.start()
-    client = RemoteInferenceModel(name, endpoint=server.endpoint)
+    client = RemoteInferenceModel(name, port=server.port)
     if mode == "sync":
         execution = SyncExecution()
         action_queue = ChunkedActionQueue()
@@ -1147,12 +1171,12 @@ def test_remote_policy_source_runs_fifty_fake_robot_ticks(mode: str) -> None:
 def test_sync_async_and_rtc_use_the_same_remote_model_interface() -> None:
     model_name = "execution-mode-check"
     served_model = _Model(model_name)
-    server = InferenceServer(served_model, model_name, listen=_free_endpoint())
+    server = InferenceServer(served_model, model_name, port=_free_port())
     server.start()
 
     model = RemoteInferenceModel(
         model_name,
-        endpoint=server.endpoint,
+        port=server.port,
         request_timeout_s=0.5,
     )
     observation = {"state": np.zeros(3, dtype=np.float32)}

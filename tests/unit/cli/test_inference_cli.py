@@ -41,7 +41,8 @@ def test_serve_parser_accepts_required_name_and_export_source() -> None:
         "--policy-name=pi05",
         "--backend=openvino",
         "--device=GPU",
-        "--listen=tcp/127.0.0.1:12345",
+        "--host=127.0.0.1",
+        "--port=12345",
     ])
 
     assert cfg.subcommand == "serve"
@@ -49,7 +50,8 @@ def test_serve_parser_accepts_required_name_and_export_source() -> None:
     assert cfg.serve.export_dir.as_posix() == "/models/pi05"
     assert cfg.serve.policy_name == "pi05"
     assert cfg.serve.device == "GPU"
-    assert cfg.serve.listen == "tcp/127.0.0.1:12345"
+    assert cfg.serve.host == "127.0.0.1"
+    assert cfg.serve.port == 12345
 
 
 def test_serve_forwards_hub_revision(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -66,7 +68,8 @@ def test_serve_forwards_hub_revision(monkeypatch: pytest.MonkeyPatch) -> None:
             return object()
 
     class _Server:
-        endpoint = "tcp/127.0.0.1:12345"
+        host = "127.0.0.1"
+        port = 12345
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
             pass
@@ -95,6 +98,23 @@ def test_serve_forwards_hub_revision(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["revision"] == "0123456789abcdef0123456789abcdef01234567"
 
 
+def test_serve_defaults_to_loopback_and_a_name_derived_port() -> None:
+    cfg = inference.build_parser().parse_args([
+        "serve", "--name=pi05", "--export-dir=/models/pi05", "--allow-all-interfaces",
+    ])
+
+    assert cfg.serve.host == "127.0.0.1"
+    assert cfg.serve.port is None
+
+
+def test_serve_rejects_public_endpoint_options() -> None:
+    for option in ("--listen", "--endpoint"):
+        with pytest.raises(SystemExit):
+            inference.build_parser().parse_args([
+                "serve", "--name=pi05", "--export-dir=/models/pi05", option, "tcp/127.0.0.1:12345",
+            ])
+
+
 def test_serve_requires_name_and_exactly_one_model_source() -> None:
     parser = inference.build_parser()
 
@@ -115,8 +135,9 @@ def test_serve_port_conflict_returns_nonzero_without_fallback(monkeypatch: pytes
             self.policy_name = "pi05"
 
     class _Server:
-        def __init__(self, _model: object, _name: str, *, listen: str, **_kwargs: object) -> None:
-            self.endpoint = listen
+        def __init__(self, _model: object, _name: str, *, host: str, port: int, **_kwargs: object) -> None:
+            self.host = host
+            self.port = port
             self.start_count = 0
 
         def start(self) -> None:

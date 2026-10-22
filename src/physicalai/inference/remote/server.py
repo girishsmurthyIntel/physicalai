@@ -8,7 +8,6 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import logging
-import re
 import threading
 import time
 import uuid
@@ -22,7 +21,7 @@ import numpy as np
 import zenoh
 
 from physicalai.inference.model import InferenceModel
-from physicalai.transport._zenoh import endpoint_for_key, make_zenoh_config, model_key_prefix
+from physicalai.transport._zenoh import derive_port, endpoint_for_key, make_zenoh_config, model_key_prefix
 
 from ._protocol import (
     DEFAULT_MAX_REQUEST_BYTES,
@@ -35,7 +34,6 @@ from ._protocol import (
 )
 
 logger = logging.getLogger(__name__)
-_LISTEN_RE = re.compile(r"^tcp/(\[[^]]+\]|[^/:]*):(\d+)\Z")
 _SUMMARY_INTERVAL_S = 30.0
 _TIMING_SAMPLES = 2048
 
@@ -59,7 +57,8 @@ class InferenceServer:
         model: InferenceModel,
         name: str,
         *,
-        listen: str | None = None,
+        host: str = "127.0.0.1",
+        port: int | None = None,
         allow_all_interfaces: bool = False,
         zenoh_config: str | Path | None = None,
         max_request_bytes: int = DEFAULT_MAX_REQUEST_BYTES,
@@ -69,8 +68,11 @@ class InferenceServer:
             raise ValueError("max_request_bytes must be a positive integer")
         self._name = name
         self._model = model
-        self._listen = listen or endpoint_for_key(self._key_prefix, "127.0.0.1")
-        self._validate_listen(self._listen, allow_all_interfaces)
+        self._host = host
+        self._port = derive_port("inference", name) if port is None else port
+        self._listen = endpoint_for_key(self._key_prefix, host, self._port)
+        if not self._is_loopback_host(host) and not allow_all_interfaces:
+            raise ValueError("Non-loopback hosts require allow_all_interfaces=True")
         self._allow_all_interfaces = allow_all_interfaces
         self._zenoh_config_path = Path(zenoh_config) if zenoh_config is not None else None
         if self._zenoh_config_path is not None:
@@ -97,14 +99,14 @@ class InferenceServer:
         self._metadata: dict[str, Any] = {}
 
     @property
-    def endpoint(self) -> str:
-        """The listen endpoint configured for this server."""
-        return self._listen
+    def host(self) -> str:
+        """The configured bind hostname or IP address."""
+        return self._host
 
     @property
-    def listen_endpoint(self) -> str:
-        """Compatibility alias for :attr:`endpoint`."""
-        return self._listen
+    def port(self) -> int:
+        """The explicit or name-derived TCP port."""
+        return self._port
 
     def start(self) -> None:
         """Open the peer session and worker without blocking."""
@@ -117,7 +119,7 @@ class InferenceServer:
             self._metadata = self._build_metadata()
             config = self._build_config()
             try:
-                self._warn_non_loopback_listener(self._listen)
+                self._warn_non_loopback_listener()
                 self._session = zenoh.open(config)
                 self._last_summary = time.monotonic()
                 self._worker = threading.Thread(target=self._worker_loop, name="PhysicalAIInference", daemon=True)
@@ -144,13 +146,14 @@ class InferenceServer:
             rtc_supported = self._metadata["rtc"]["supported"]
             logger.info(
                 "Inference server started: name=%s policy=%s manifest_sha256=%s chunk_size=%s "
-                "rtc_supported=%s listen=%s",
+                "rtc_supported=%s host=%s port=%s",
                 self._name,
                 self._metadata["policy"]["name"],
                 self._metadata["policy"]["manifest_sha256"],
                 self._metadata["chunk_size"],
                 rtc_supported,
-                self._listen,
+                self._host,
+                self._port,
             )
 
     def serve_forever(self) -> None:
@@ -236,42 +239,19 @@ class InferenceServer:
         }
 
     @staticmethod
-    def _listen_host(endpoint: str) -> str:
-        match = _LISTEN_RE.fullmatch(endpoint)
-        if match is None:
-            raise ValueError("listen must be a TCP endpoint in the form tcp/ADDR:PORT")
-        return match.group(1).strip("[]")
-
-    @staticmethod
     def _is_loopback_host(host: str) -> bool:
         try:
             return ipaddress.ip_address(host).is_loopback
         except ValueError:
             return host.lower() == "localhost"
 
-    @classmethod
-    def _warn_non_loopback_listener(cls, endpoint: str) -> None:
-        host = cls._listen_host(endpoint)
-        if not cls._is_loopback_host(host):
-            port = endpoint.rsplit(":", maxsplit=1)[-1]
+    def _warn_non_loopback_listener(self) -> None:
+        if not self._is_loopback_host(self._host):
             logger.warning(
                 "inference server reachable at :%s without Zenoh-level authentication — "
                 "use only on a trusted network or tailnet",
-                port,
+                self._port,
             )
-
-    @classmethod
-    def _validate_listen(cls, endpoint: str, allow_all_interfaces: bool) -> None:
-        match = _LISTEN_RE.fullmatch(endpoint)
-        if match is None:
-            raise ValueError("listen must be a TCP endpoint in the form tcp/ADDR:PORT")
-        host = cls._listen_host(endpoint)
-        port = int(match.group(2))
-        if not 1 <= port <= 65535:
-            raise ValueError("listen port must be between 1 and 65535")
-        loopback = cls._is_loopback_host(host)
-        if not loopback and not allow_all_interfaces:
-            raise ValueError("Non-loopback listen endpoints require allow_all_interfaces=True")
 
     def _on_query(self, query: zenoh.Query, command: str) -> None:
         received_at = time.monotonic()

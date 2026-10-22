@@ -17,13 +17,12 @@ from pathlib import Path
 from physicalai.inference import InferenceModel, RemoteInferenceModel
 from physicalai.inference.remote import InferenceServer
 
-_ENDPOINT = "tcp/127.0.0.1:7447"
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("mode", choices=("server", "client"))
     parser.add_argument("--name", required=True, help="Deployment slot name shared by this server and client")
+    parser.add_argument("--host", default="127.0.0.1", help="Server hostname or IP address")
+    parser.add_argument("--port", type=int, help="TCP port; otherwise derived from --name")
     parser.add_argument("--export-dir", type=Path, help="Server-side exported model directory (server mode only)")
     parser.add_argument("--policy-name", help="Policy name inside the export (server mode only)")
     parser.add_argument("--device", default="auto", help="Inference device (server mode only)")
@@ -37,7 +36,7 @@ def main() -> None:
             policy_name=args.policy_name,
             device=args.device,
         )
-        server = InferenceServer(model, name=args.name, listen=_ENDPOINT)
+        server = InferenceServer(model, name=args.name, host=args.host, port=args.port)
         try:
             server.serve_forever()
         except KeyboardInterrupt:
@@ -46,7 +45,7 @@ def main() -> None:
             server.stop()
         return
 
-    with RemoteInferenceModel(name=args.name, endpoint=_ENDPOINT) as model:
+    with RemoteInferenceModel(name=args.name, host=args.host, port=args.port) as model:
         print(model.metadata)
         # Call model.predict_action_chunk(observation) with model-ready inputs here.
 

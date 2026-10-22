@@ -21,7 +21,7 @@ import zenoh
 from physicalai.config import export_config
 from physicalai.inference.constants import ACTION
 from physicalai.inference.model import InferenceModel
-from physicalai.transport._zenoh import endpoint_for_key, make_zenoh_config, model_key_prefix, open_zenoh_session
+from physicalai.transport._zenoh import derive_port, endpoint_for_key, make_zenoh_config, model_key_prefix, open_zenoh_session
 
 from ._protocol import (
     DEFAULT_IMAGE_JPEG_QUALITY,
@@ -52,7 +52,8 @@ class RemoteInferenceModel(InferenceModel):
         self,
         name: str,
         *,
-        endpoint: str | None = None,
+        host: str = "127.0.0.1",
+        port: int | None = None,
         expected_policy: str | None = None,
         expected_manifest_sha256: str | None = None,
         request_timeout_s: float = 2.0,
@@ -62,10 +63,6 @@ class RemoteInferenceModel(InferenceModel):
         zenoh_config: str | Path | None = None,
     ) -> None:
         self._key_prefix = model_key_prefix(name)
-        if endpoint is not None and (
-            not isinstance(endpoint, str) or not endpoint or any(c.isspace() for c in endpoint)
-        ):
-            raise ValueError("endpoint must be a non-empty Zenoh endpoint")
         if (
             isinstance(request_timeout_s, bool)
             or not math.isfinite(request_timeout_s)
@@ -88,7 +85,9 @@ class RemoteInferenceModel(InferenceModel):
 
         self._name = name
         self.policy_name = expected_policy or name
-        self._endpoint = endpoint or endpoint_for_key(self._key_prefix, "127.0.0.1")
+        self._host = host
+        self._port = derive_port("inference", name) if port is None else port
+        self._endpoint = endpoint_for_key(self._key_prefix, host, self._port)
         self._expected_policy = expected_policy
         self._expected_manifest_sha256 = expected_manifest_sha256
         self._request_timeout_s = float(request_timeout_s)
@@ -154,7 +153,7 @@ class RemoteInferenceModel(InferenceModel):
                 while not self._all_queries_match():
                     if time.monotonic() >= deadline:
                         raise RemoteInferenceUnavailableError(
-                            f"Inference server {self._name!r} at {self._endpoint} is unavailable; is "
+                            f"Inference server {self._name!r} at host {self._host!r}, port {self._port} is unavailable; is "
                             f"`physicalai inference serve --name {self._name}` running, and is the SSH tunnel up / "
                             "address reachable?"
                         )
@@ -190,7 +189,7 @@ class RemoteInferenceModel(InferenceModel):
             except Exception as error:
                 self._close_locked()
                 raise RemoteInferenceUnavailableError(
-                    f"Inference server {self._name!r} at {self._endpoint} is unavailable; "
+                    f"Inference server {self._name!r} at host {self._host!r}, port {self._port} is unavailable; "
                     f"is `physicalai inference serve --name {self._name}` running, and is the SSH tunnel up / "
                     f"address reachable? ({error})"
                 ) from error
@@ -251,14 +250,19 @@ class RemoteInferenceModel(InferenceModel):
 
     def __repr__(self) -> str:
         return (
-            f"RemoteInferenceModel(name={self._name!r}, endpoint={self._endpoint!r}, "
+            f"RemoteInferenceModel(name={self._name!r}, host={self._host!r}, port={self._port!r}, "
             f"connected={self._server_id is not None})"
         )
 
     @property
-    def endpoint(self) -> str:
-        """The configured Zenoh endpoint."""
-        return self._endpoint
+    def host(self) -> str:
+        """The configured server hostname or IP address."""
+        return self._host
+
+    @property
+    def port(self) -> int:
+        """The explicit or name-derived TCP port."""
+        return self._port
 
     @property
     def chunk_size(self) -> int:

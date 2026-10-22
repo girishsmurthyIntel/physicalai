@@ -2,7 +2,7 @@
 
 Use a `RemoteInferenceModel` on the robot client and a normal exported `InferenceModel` on the inference server. Choose `SyncExecution`, `AsyncExecution`, or `RTCExecution` independently in the client runtime configuration.
 
-Choose an explicit deployment-slot name, independently of the model policy and host, and use it on both client and server. For example, two servers running `pi05` can be named `cell1-act` and `cell2-act`. Zenoh keys are scoped below `physicalai/inference/{name}`, and the default TCP port is derived from that namespace. At startup, the client connects to one configured endpoint with multicast and gossip disabled, then checks the protocol version, policy identity, and server identity in a handshake.
+Choose an explicit deployment-slot name, independently of the model policy and host, and use it on both client and server. For example, two servers running `pi05` can be named `cell1-act` and `cell2-act`. Zenoh keys are scoped below `physicalai/inference/{name}`, and the default TCP port is derived from that namespace. Both Python constructors accept `host` (default `127.0.0.1`) and optional `port`; Zenoh endpoint strings are internal. At startup, the client connects to that host and port with multicast and gossip disabled, then checks the protocol version, policy identity, and server identity in a handshake.
 
 The exported model stays on the inference server. The client protocol accepts observations and returns model outputs; it does not accept model uploads, export paths, or class paths. Export the model on the server, then transfer the export separately:
 
@@ -43,7 +43,7 @@ uv run physicalai inference serve --name cell1-act \
 
 Pin `--revision` to a reviewed commit SHA for reproducible Hub deployments. If omitted, the Hub's default revision is used.
 
-The server defaults to `tcp/127.0.0.1:P` and prints an SSH tunnel command. This is the recommended setup: SSH key authentication and encryption protect the connection, and the client leaves `endpoint` unset so it connects through the local forwarded port. On the client, run the printed command, or:
+The server defaults to host `127.0.0.1` and name-derived port `P`, and prints an SSH tunnel command. This is the recommended setup: SSH key authentication and encryption protect the connection, and the client leaves `host` and `port` unset so it connects through the local forwarded port. On the client, run the printed command, or:
 
 ```bash
 ssh -N -L P:127.0.0.1:P user@inference-host
@@ -55,16 +55,16 @@ Keep the tunnel open. To find the deterministic port without starting the model 
 uv run physicalai inference port cell1-act
 ```
 
-An explicit `--port PORT` changes the server's port. For a Tailscale deployment, listen on the server's Tailscale address and use the same address on the client:
+An explicit `--port PORT` changes the server's port; set the client's `port` to match. For a Tailscale deployment, bind the server's Tailscale address and use the same address on the client:
 
 ```bash
 uv run physicalai inference serve --name cell1-act \
   --export-dir ~/models/pi05/openvino \
-  --listen tcp/100.90.0.12:45000 \
+  --host 100.90.0.12 --port 45000 \
   --allow-all-interfaces
 ```
 
-Set the client model's `endpoint` to `tcp/100.90.0.12:45000`. Restrict access with tailnet ACLs. The same pattern applies to a WireGuard interface address, with peer access restricted by the WireGuard configuration.
+Set the client model's `host` to `100.90.0.12` and `port` to `45000`. Restrict access with tailnet ACLs. The same pattern applies to a WireGuard interface address, with peer access restricted by the WireGuard configuration.
 
 For direct LAN access, bind the server's LAN address and opt in:
 
@@ -74,11 +74,11 @@ uv run physicalai inference serve --name cell1-act \
   --policy-name pi05 \
   --backend openvino \
   --device GPU \
-  --listen tcp/192.168.1.20:45000 \
+  --host 192.168.1.20 --port 45000 \
   --allow-all-interfaces
 ```
 
-Set the client model endpoint to `tcp/192.168.1.20:45000`. This transport has no Zenoh-level authentication or encryption: use it only on an isolated VLAN with firewall rules that limit access to trusted clients. The server logs an unauthenticated-exposure warning for every non-loopback listener. It never selects a fallback port when the requested port is occupied.
+Set the client model's `host` to `192.168.1.20` and `port` to `45000`. This transport has no Zenoh-level authentication or encryption: use it only on an isolated VLAN with firewall rules that limit access to trusted clients. The server logs an unauthenticated-exposure warning for every non-loopback listener. It never selects a fallback port when the requested port is occupied. `--allow-all-interfaces` permits a non-loopback bind but does not change `--host`; to bind every IPv4 interface, explicitly use `--host 0.0.0.0` with that flag.
 
 ## Robots and GPUs
 
@@ -164,7 +164,7 @@ init_args:
   task: "pick up the red cube and place it in the blue bowl"
 ```
 
-With the default SSH tunnel, omit `endpoint`; the client connects to loopback at the port derived from its name. For Tailscale, WireGuard, or direct LAN, set `endpoint` to the server address shown in the corresponding setup above.
+With the default SSH tunnel, omit `host` and `port`; the client connects to loopback at the port derived from its name. For Tailscale, WireGuard, or direct LAN, set `host` and optional `port` to the values shown above. For example, add `host: 100.90.0.12` and `port: 45000` alongside `name` in the model's `init_args`. IPv6 hosts use address literals such as `::1`, without a `tcp/` prefix or port suffix.
 
 Add the selected `action_source` block to your existing runtime YAML, keeping your robot and camera configuration, then run:
 
@@ -184,8 +184,8 @@ The client constructor performs no network I/O, so its configuration can be roun
 |---|---|
 | No matching server | Confirm the server process is running with the same `--name`; run `physicalai inference port NAME` on both ends and compare the derived port. |
 | SSH tunnel down | Restart `ssh -N -L P:127.0.0.1:P user@inference-host` on the client and keep it open; test the local forwarded port with `nc -vz 127.0.0.1 P`. |
-| Firewall blocks a direct endpoint | Allow inbound TCP `P` only from trusted client addresses in the host and cloud firewalls; verify with `nc -vz SERVER_IP P`. |
-| Port already in use | The server exits without selecting another port. Choose another `--name` or explicit `--port`, then update the client endpoint if needed. |
+| Firewall blocks a direct connection | Allow inbound TCP `P` only from trusted client addresses in the host and cloud firewalls; verify with `nc -vz SERVER_IP P`. |
+| Port already in use | The server exits without selecting another port. Choose another `--name` or explicit `--port`, then update the client's `name` or `port` to match. |
 | Model mismatch | Compare the server's policy name and manifest SHA-256 with any client `expected_policy` / `expected_manifest_sha256` pins; ensure the export on the server is the intended version. |
 
 ## Robots and GPUs

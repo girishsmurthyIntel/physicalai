@@ -17,7 +17,7 @@ from typing import TYPE_CHECKING
 from jsonargparse import ArgumentParser
 
 from physicalai.cli._spec import SubcommandSpec  # noqa: PLC2701
-from physicalai.transport._zenoh import derive_port, endpoint_for_key, model_key_prefix
+from physicalai.transport._zenoh import derive_port, model_key_prefix
 
 if TYPE_CHECKING:
     from jsonargparse import Namespace
@@ -51,10 +51,9 @@ def _build_serve_parser() -> ArgumentParser:
     parser.add_argument("--policy-name", default=None, help="Policy name; auto-detected from the export if omitted")
     parser.add_argument("--backend", choices=("auto", "openvino", "onnx"), default="auto", help="Inference backend")
     parser.add_argument("--device", default="auto", help="Inference device")
-    listen = parser.add_mutually_exclusive_group()
-    listen.add_argument("--listen", help="Full TCP listen endpoint")
-    listen.add_argument("--port", type=int, help="TCP port; otherwise derived from --name")
-    parser.add_argument("--allow-all-interfaces", action="store_true", help="Allow non-loopback listen endpoints")
+    parser.add_argument("--host", default="127.0.0.1", help="Bind hostname or IP address (default: loopback)")
+    parser.add_argument("--port", type=int, help="TCP port; otherwise derived from --name")
+    parser.add_argument("--allow-all-interfaces", action="store_true", help="Allow binding a non-loopback host")
     parser.add_argument("--zenoh-config", type=Path, help="Replace the built-in Zenoh configuration")
     return parser
 
@@ -106,14 +105,11 @@ def _serve(cfg: Namespace) -> int:
             backend=cfg.backend,
             device=cfg.device,
         )
-    listen = cfg.listen
-    if listen is None:
-        host = "0.0.0.0" if cfg.allow_all_interfaces else "127.0.0.1"
-        listen = endpoint_for_key(model_key_prefix(cfg.name), host, cfg.port)
     server = InferenceServer(
         model,
         cfg.name,
-        listen=listen,
+        host=cfg.host,
+        port=cfg.port,
         allow_all_interfaces=cfg.allow_all_interfaces,
         zenoh_config=cfg.zenoh_config,
     )
@@ -126,20 +122,19 @@ def _serve(cfg: Namespace) -> int:
 
     try:
         server.start()
-        listen_host = server.endpoint.removeprefix("tcp/").rsplit(":", maxsplit=1)[0].strip("[]")
         try:
-            loopback = ipaddress.ip_address(listen_host).is_loopback
+            loopback = ipaddress.ip_address(server.host).is_loopback
         except ValueError:
-            loopback = listen_host.lower() == "localhost"
+            loopback = server.host.lower() == "localhost"
         if loopback:
-            port = server.endpoint.rsplit(":", maxsplit=1)[-1]
+            port = server.port
             logger.info("SSH tunnel: ssh -N -L %s:127.0.0.1:%s %s", port, port, socket.gethostname())
         for signum in (signal.SIGINT, signal.SIGTERM):
             previous_handlers[signum] = signal.signal(signum, stop_server)
         server.serve_forever()
     except Exception as error:
         message = str(error).lower()
-        port = server.endpoint.rsplit(":", maxsplit=1)[-1]
+        port = server.port
         if (
             (isinstance(error, OSError) and error.errno == errno.EADDRINUSE)
             or "address already in use" in message
