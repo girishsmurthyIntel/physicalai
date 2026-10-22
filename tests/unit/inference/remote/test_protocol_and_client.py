@@ -553,6 +553,33 @@ def test_predict_request_rejects_non_integer_protocol_versions(version: object) 
         decode_predict_request(request)
 
 
+def test_decoded_request_and_reply_arrays_are_writable() -> None:
+    payload = encode_predict_request(
+        {
+            "state": np.asarray([[1.0, 2.0]], dtype=np.float32),
+            "images.top": np.zeros((1, 4, 4, 3), dtype=np.uint8),
+        },
+        seq=1,
+        budget_ms=2000,
+        image_codec="raw",
+        jpeg_quality=90,
+        max_image_side=None,
+    )
+    _, inputs = decode_predict_request(payload)
+    reply = encode_predict_reply(
+        {"action": np.ones((1, 4, 3), dtype=np.float32)},
+        seq=1,
+        server_id="test-server",
+        server_queue_s=0.0,
+        server_compute_s=0.0,
+    )
+    outputs = decode_predict_reply(reply)["outputs"]
+
+    assert inputs["state"].flags.writeable
+    assert inputs["images.top"].flags.writeable
+    assert outputs["action"].flags.writeable
+
+
 def test_predict_reply_preserves_the_full_model_output_map() -> None:
     outputs = {
         "action": np.ones((1, 4, 3), dtype=np.float32),

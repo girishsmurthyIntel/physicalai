@@ -322,6 +322,9 @@ def decode_predict_request(
     overlap = inputs.keys() & image_inputs.keys()
     if overlap:
         raise RemoteInferenceProtocolError(f"Duplicate input and image keys: {sorted(overlap)!r}")
+    for name, value in inputs.items():
+        if isinstance(value, np.ndarray):
+            inputs[name] = value.copy()
     inputs.update(image_inputs)
     return message, inputs
 
@@ -378,4 +381,6 @@ def decode_predict_reply(payload: bytes) -> dict[str, Any]:
         value = message.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise RemoteInferenceProtocolError(f"Prediction reply has invalid {field}")
+    for name, value in outputs.items():
+        outputs[name] = value.copy()
     return message
