@@ -282,7 +282,7 @@ def main() -> None:
     parser.add_argument(
         "--allow-all-interfaces",
         action="store_true",
-        help="Permit a non-loopback listen host in server mode",
+        help="Permit wildcard binds (0.0.0.0 or ::) in server mode without changing --host",
     )
     parser.add_argument(
         "--port",

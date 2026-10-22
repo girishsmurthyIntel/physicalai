@@ -53,7 +53,7 @@ def _build_serve_parser() -> ArgumentParser:
     parser.add_argument("--device", default="auto", help="Inference device")
     parser.add_argument("--host", default="127.0.0.1", help="Bind hostname or IP address (default: loopback)")
     parser.add_argument("--port", type=int, help="TCP port; otherwise derived from --name")
-    parser.add_argument("--allow-all-interfaces", action="store_true", help="Allow binding a non-loopback host")
+    parser.add_argument("--allow-all-interfaces", action="store_true", help="Allow wildcard binds (0.0.0.0 or ::)")
     parser.add_argument("--zenoh-config", type=Path, help="Replace the built-in Zenoh configuration")
     return parser
 

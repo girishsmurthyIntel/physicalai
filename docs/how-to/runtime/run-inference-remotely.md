@@ -60,13 +60,12 @@ An explicit `--port PORT` changes the server's port; set the client's `port` to 
 ```bash
 uv run physicalai inference serve --name cell1-act \
   --export-dir ~/models/pi05/openvino \
-  --host 100.90.0.12 --port 45000 \
-  --allow-all-interfaces
+  --host 100.90.0.12 --port 45000
 ```
 
 Set the client model's `host` to `100.90.0.12` and `port` to `45000`. Restrict access with tailnet ACLs. The same pattern applies to a WireGuard interface address, with peer access restricted by the WireGuard configuration.
 
-For direct LAN access, bind the server's LAN address and opt in:
+For direct LAN access, bind the server's LAN address:
 
 ```bash
 uv run physicalai inference serve --name cell1-act \
@@ -74,11 +73,10 @@ uv run physicalai inference serve --name cell1-act \
   --policy-name pi05 \
   --backend openvino \
   --device GPU \
-  --host 192.168.1.20 --port 45000 \
-  --allow-all-interfaces
+  --host 192.168.1.20 --port 45000
 ```
 
-Set the client model's `host` to `192.168.1.20` and `port` to `45000`. This transport has no Zenoh-level authentication or encryption: use it only on an isolated VLAN with firewall rules that limit access to trusted clients. The server logs an unauthenticated-exposure warning for every non-loopback listener. It never selects a fallback port when the requested port is occupied. `--allow-all-interfaces` permits a non-loopback bind but does not change `--host`; to bind every IPv4 interface, explicitly use `--host 0.0.0.0` with that flag.
+Set the client model's `host` to `192.168.1.20` and `port` to `45000`. This transport has no Zenoh-level authentication or encryption: use it only on an isolated VLAN with firewall rules that limit access to trusted clients. The server logs an unauthenticated-exposure warning for every non-loopback listener. It never selects a fallback port when the requested port is occupied. Specific LAN, Tailscale, or WireGuard addresses do not require an additional opt-in. Wildcard binds (`--host 0.0.0.0` or `--host ::`) require `--allow-all-interfaces`. That flag alone does not change `--host`, which still defaults to `127.0.0.1`.
 
 ## Robots and GPUs
 

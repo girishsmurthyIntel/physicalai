@@ -71,8 +71,8 @@ class InferenceServer:
         self._host = host
         self._port = derive_port("inference", name) if port is None else port
         self._listen = endpoint_for_key(self._key_prefix, host, self._port)
-        if not self._is_loopback_host(host) and not allow_all_interfaces:
-            raise ValueError("Non-loopback hosts require allow_all_interfaces=True")
+        if self._is_wildcard_host(host) and not allow_all_interfaces:
+            raise ValueError("Wildcard hosts require allow_all_interfaces=True")
         self._allow_all_interfaces = allow_all_interfaces
         self._zenoh_config_path = Path(zenoh_config) if zenoh_config is not None else None
         if self._zenoh_config_path is not None:
@@ -85,7 +85,7 @@ class InferenceServer:
 
         self._lifecycle_lock = threading.RLock()
         self._condition = threading.Condition()
-        self._queue: deque[_Request] = deque(maxlen=2)
+        self._queue: deque[_Request] = deque()
         self._session: zenoh.Session | None = None
         self._queryables: list[Any] = []
         self._worker: threading.Thread | None = None
@@ -239,6 +239,13 @@ class InferenceServer:
         }
 
     @staticmethod
+    def _is_wildcard_host(host: str) -> bool:
+        try:
+            return ipaddress.ip_address(host).is_unspecified
+        except ValueError:
+            return False
+
+    @staticmethod
     def _is_loopback_host(host: str) -> bool:
         try:
             return ipaddress.ip_address(host).is_loopback
@@ -247,9 +254,11 @@ class InferenceServer:
 
     def _warn_non_loopback_listener(self) -> None:
         if not self._is_loopback_host(self._host):
+            address = f"[{self._host}]" if ":" in self._host else self._host
             logger.warning(
-                "inference server reachable at :%s without Zenoh-level authentication — "
+                "inference server reachable at %s:%s without Zenoh-level authentication — "
                 "use only on a trusted network or tailnet",
+                address,
                 self._port,
             )
 
@@ -317,12 +326,13 @@ class InferenceServer:
             if self._stopping.is_set():
                 self._reply_error(request.query, request.seq, "shutting_down")
                 return
-            for pending in tuple(self._queue):
-                if pending.command == request.command:
+            if request.command == "predict":
+                for pending in tuple(self._queue):
+                    if pending.command != "predict":
+                        continue
                     self._queue.remove(pending)
                     self._reply_error(pending.query, pending.seq, "superseded")
-                    if request.command == "predict":
-                        self._counts["superseded"] += 1
+                    self._counts["superseded"] += 1
                     break
             self._queue.append(request)
             self._condition.notify()

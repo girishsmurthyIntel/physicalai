@@ -103,7 +103,9 @@ Read-only `host` and `port` properties expose the configured host and resolved
 port. Zenoh endpoint strings are internal, not constructor arguments or public
 properties.
 
-`InferenceServer` requires `allow_all_interfaces=True` for a non-loopback host;
-that flag does not change the configured host. See
+`InferenceServer` requires `allow_all_interfaces=True` only for wildcard hosts
+(`0.0.0.0` or `::`), not specific LAN or Tailscale addresses. Every non-loopback
+listener logs an unauthenticated-exposure warning. The flag does not change the
+configured host; without `host`, the server still binds `127.0.0.1`. See
 [Run Inference Remotely](../how-to/runtime/run-inference-remotely.md) for server
 lifecycle, CLI, SSH tunneling, and deployment configuration.

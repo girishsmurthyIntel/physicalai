@@ -617,10 +617,25 @@ def test_predict_reply_preserves_the_full_model_output_map() -> None:
     np.testing.assert_array_equal(decoded["outputs"]["aux"], outputs["aux"])
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "::", "100.64.0.10", "192.168.1.20"])
-def test_non_loopback_listeners_require_opt_in(host: str) -> None:
+@pytest.mark.parametrize("host", ["0.0.0.0", "::", "0:0:0:0:0:0:0:0"])
+def test_wildcard_listeners_require_opt_in(host: str) -> None:
     with pytest.raises(ValueError, match="allow_all_interfaces"):
         InferenceServer(_Model("listener-security"), "listener-security", host=host, port=5555)
+
+
+@pytest.mark.parametrize("host", ["100.64.0.10", "192.168.1.20", "fd7a:115c:a1e0::1"])
+def test_specific_remote_listeners_are_allowed_without_opt_in_and_warn(
+    host: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    server = InferenceServer(_Model("specific-host"), "specific-host", host=host, port=5555)
+
+    with caplog.at_level(logging.WARNING, logger="physicalai.inference.remote.server"):
+        server._warn_non_loopback_listener()  # noqa: SLF001
+
+    assert server.host == host
+    assert server.port == 5555
+    assert "without Zenoh-level authentication" in caplog.text
 
 
 @pytest.mark.parametrize("host", ["0.0.0.0", "::", "100.64.0.10", "192.168.1.20"])
@@ -637,16 +652,26 @@ def test_non_loopback_listeners_are_allowed_with_explicit_opt_in(host: str) -> N
     assert server.port == 5555
 
 
-@pytest.mark.parametrize("host", ["0.0.0.0", "::", "100.64.0.10", "192.168.1.20"])
+@pytest.mark.parametrize(
+    ("host", "address"),
+    [
+        ("0.0.0.0", "0.0.0.0:5555"),
+        ("::", "[::]:5555"),
+        ("100.64.0.10", "100.64.0.10:5555"),
+        ("192.168.1.20", "192.168.1.20:5555"),
+        ("fd7a:115c:a1e0::1", "[fd7a:115c:a1e0::1]:5555"),
+    ],
+)
 def test_non_loopback_listener_logs_unauthenticated_exposure_warning(
     host: str,
+    address: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
     with caplog.at_level(logging.WARNING, logger="physicalai.inference.remote.server"):
         server = InferenceServer(_Model("warning"), "warning", host=host, port=5555, allow_all_interfaces=True)
         server._warn_non_loopback_listener()  # noqa: SLF001
 
-    assert "inference server reachable at :5555 without Zenoh-level authentication" in caplog.text
+    assert f"inference server reachable at {address} without Zenoh-level authentication" in caplog.text
     assert "use only on a trusted network or tailnet" in caplog.text
 
 
@@ -824,6 +849,36 @@ def test_new_predict_supersedes_the_only_pending_prediction() -> None:
     assert server._queue[0].seq == 11  # noqa: SLF001
     server._queue.clear()  # noqa: SLF001
     server.stop()
+
+
+@pytest.mark.parametrize("reset_count", [2, 3])
+def test_pending_resets_are_preserved_when_predictions_are_superseded(reset_count: int) -> None:
+    class _Query:
+        def __init__(self) -> None:
+            self.error: bytes | None = None
+
+        def reply_err(self, payload: bytes) -> None:
+            self.error = payload
+
+    server = InferenceServer(_Model("pending-resets"), "pending-resets")
+    reset_queries = [_Query() for _ in range(reset_count)]
+    old_query = _Query()
+    latest_query = _Query()
+    now = time.monotonic()
+    try:
+        server._enqueue(_Request(old_query, "predict", 10, 1000, now, 12, {}))  # noqa: SLF001
+        for query in reset_queries:
+            server._enqueue(_Request(query, "reset", -1, 1000, now, 12))  # noqa: SLF001
+        server._enqueue(_Request(latest_query, "predict", 11, 1000, now, 12, {}))  # noqa: SLF001
+
+        assert all(query.error is None for query in reset_queries)
+        assert latest_query.error is None
+        assert old_query.error is not None
+        assert decode_message(old_query.error)["code"] == "superseded"
+        assert [request.query for request in server._queue] == [*reset_queries, latest_query]  # noqa: SLF001
+        assert server._counts["superseded"] == 1  # noqa: SLF001
+    finally:
+        server.stop()
 
 
 def test_live_newest_wins_supersedes_pending_request_while_worker_is_busy() -> None:
