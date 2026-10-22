@@ -511,7 +511,6 @@ class TestGetRunnerFactory:
         manifest_dict = {"runner": {"class_path": "physicalai.inference.runners.SinglePass", "init_args": {}}}
         assert isinstance(get_runner(manifest_dict), SinglePass)
 
-
     def test_manifest_runner_spec_takes_priority_over_flat_kwargs(self) -> None:
         manifest_dict = {
             "use_action_queue": True,
@@ -804,8 +803,9 @@ class TestHubLoading:
         assert model.backend == "onnx"
 
     def test_from_pretrained_rejects_export_dir(self) -> None:
-        with patch("physicalai.inference.model.download_from_hub") as mock_download, pytest.raises(
-            TypeError, match="does not accept export_dir"
+        with (
+            patch("physicalai.inference.model.download_from_hub") as mock_download,
+            pytest.raises(TypeError, match="does not accept export_dir"),
         ):
             InferenceModel.from_pretrained("physical-ai/act-cube", export_dir="/tmp/leak")
 
@@ -877,3 +877,75 @@ class TestPolicyNameValidation:
 
         model = InferenceModel(export_dir)
         assert model.policy_name == name
+
+
+@pytest.mark.usefixtures("_patch_adapter")
+class TestClose:
+    def test_close_notifies_callbacks_then_releases_the_adapter_once(
+        self,
+        tmp_path: Path,
+        mock_adapter: MagicMock,
+    ) -> None:
+        events: list[str] = []
+        callback = MagicMock()
+        callback.on_close.side_effect = lambda: events.append("callback")
+        mock_adapter.close.side_effect = lambda: events.append("adapter")
+        model = InferenceModel(_make_export_dir(tmp_path), callbacks=[callback])
+
+        model.close()
+        model.close()
+
+        assert events == ["callback", "adapter"]
+
+    def test_all_resources_are_closed_when_a_callback_fails(
+        self,
+        tmp_path: Path,
+        mock_adapter: MagicMock,
+    ) -> None:
+        events: list[str] = []
+        first = MagicMock()
+        second = MagicMock()
+
+        def fail_callback() -> None:
+            events.append("first")
+            raise RuntimeError("callback cleanup failed")
+
+        first.on_close.side_effect = fail_callback
+        second.on_close.side_effect = lambda: events.append("second")
+        mock_adapter.close.side_effect = lambda: events.append("adapter")
+        model = InferenceModel(_make_export_dir(tmp_path), callbacks=[first, second])
+
+        with pytest.raises(ExceptionGroup, match="Errors occurred while closing") as exc_info:
+            model.close()
+
+        assert events == ["first", "second", "adapter"]
+        assert len(exc_info.value.exceptions) == 1
+        assert str(exc_info.value.exceptions[0]) == "callback cleanup failed"
+        model.close()  # Cleanup is attempted once, even when a hook raises.
+        assert events == ["first", "second", "adapter"]
+
+    def test_adapter_is_closed_when_its_close_hook_fails_after_callbacks(
+        self,
+        tmp_path: Path,
+        mock_adapter: MagicMock,
+    ) -> None:
+        callback = MagicMock()
+        mock_adapter.close.side_effect = RuntimeError("adapter cleanup failed")
+        model = InferenceModel(_make_export_dir(tmp_path), callbacks=[callback])
+
+        with pytest.raises(ExceptionGroup, match="Errors occurred while closing") as exc_info:
+            model.close()
+
+        callback.on_close.assert_called_once_with()
+        assert len(exc_info.value.exceptions) == 1
+        assert str(exc_info.value.exceptions[0]) == "adapter cleanup failed"
+
+    def test_context_manager_closes_the_model(self, tmp_path: Path, mock_adapter: MagicMock) -> None:
+        with InferenceModel(_make_export_dir(tmp_path)) as model:
+            assert isinstance(model, InferenceModel)
+            mock_adapter.close.assert_not_called()
+
+        mock_adapter.close.assert_called_once_with()
+
+    def test_base_adapter_close_is_a_no_op(self) -> None:
+        assert TestAdapter().close() is None

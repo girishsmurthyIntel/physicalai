@@ -15,9 +15,18 @@ from __future__ import annotations
 
 from typing import Any
 
+import zenoh
+
 from physicalai.transport._zenoh import endpoint_for_key, open_zenoh_session
 
 from ._ids import robot_prefix
+
+# A subscriber usually opens its session before the owner it spawns is listening. Zenoh's
+# default connect retry backs off to multi-second periods (1 s, 2 s, 4 s, ...), so an owner
+# that becomes ready just after a retry stays unreachable for seconds: long enough for
+# ``SharedRobot.connect`` to give up on ``/metadata`` or for a short ``idle_timeout`` to stop
+# the owner. Retrying the localhost endpoint quickly costs nothing.
+_CONNECT_RETRY = '{"period_init_ms": 100, "period_max_ms": 500, "period_increase_factor": 1.5}'
 
 
 def open_session(name: str | None = None, *, listen: bool = False, allow_remote: bool = False) -> Any:  # noqa: ANN401
@@ -39,7 +48,8 @@ def open_session(name: str | None = None, *, listen: bool = False, allow_remote:
             scouting-only session with no fixed endpoint (used by
             :func:`discover_robots`).
         listen: True for the owner (listen on the derived port), False for
-            subscribers (connect to localhost).
+            subscribers (connect to localhost, retrying every 100-500 ms
+            until the owner listens).
         allow_remote: When False (default), disables multicast/gossip
             scouting and binds the owner's listen endpoint to ``127.0.0.1``
             only — the session is unreachable off-host. When True, enables
@@ -52,6 +62,7 @@ def open_session(name: str | None = None, *, listen: bool = False, allow_remote:
     """
     connect_endpoints: list[str] | None = None
     listen_endpoints: list[str] | None = None
+    config = zenoh.Config()
     if name is not None:
         if listen:
             bind_host = "0.0.0.0" if allow_remote else "127.0.0.1"  # noqa: S104  # nosec B104: explicit remote opt-in
@@ -60,10 +71,12 @@ def open_session(name: str | None = None, *, listen: bool = False, allow_remote:
         else:
             connect_endpoints = [endpoint_for_key(robot_prefix(name), "127.0.0.1")]
             listen_endpoints = []
+            config.insert_json5("connect/retry", _CONNECT_RETRY)
     return open_zenoh_session(
         mode="peer",
         connect_endpoints=connect_endpoints,
         listen_endpoints=listen_endpoints,
         multicast_enabled=allow_remote,
         gossip_enabled=allow_remote,
+        config=config,
     )
