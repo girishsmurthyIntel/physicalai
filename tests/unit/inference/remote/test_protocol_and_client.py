@@ -552,6 +552,7 @@ def test_protocol_v1_message_schemas_are_direct_maps() -> None:
         "seq",
         "server_id",
         "outputs",
+        "server_decode_s",
         "server_queue_s",
         "server_compute_s",
     }
@@ -596,6 +597,31 @@ def test_decoded_request_and_reply_arrays_are_writable() -> None:
     assert inputs["state"].flags.writeable
     assert inputs["images.top"].flags.writeable
     assert outputs["action"].flags.writeable
+
+
+@pytest.mark.parametrize("decode_s", [None, True, -1.0, float("nan"), float("inf"), "0.1"])
+def test_predict_reply_rejects_invalid_server_decode_timing(decode_s: object) -> None:
+    reply = encode_predict_reply(
+        {}, seq=1, server_id="timing-server", server_queue_s=0.0, server_compute_s=0.0,
+    )
+    metadata = decode_message(reply)
+    metadata["server_decode_s"] = decode_s
+
+    with pytest.raises(RemoteInferenceProtocolError, match="server_decode_s"):
+        decode_predict_reply(encode_message(metadata))
+
+
+def test_predict_reply_accepts_legacy_timing_without_server_decode() -> None:
+    reply = encode_predict_reply(
+        {}, seq=1, server_id="timing-server", server_queue_s=0.1, server_compute_s=0.2,
+    )
+    metadata = decode_message(reply)
+    del metadata["server_decode_s"]
+
+    decoded = decode_predict_reply(encode_message(metadata))
+
+    assert decoded["server_decode_s"] == 0.0
+    assert decoded["server_queue_s"] == 0.1
 
 
 def test_predict_reply_preserves_the_full_model_output_map() -> None:
@@ -951,6 +977,68 @@ def test_live_newest_wins_supersedes_pending_request_while_worker_is_busy() -> N
         server.stop()
 
 
+@pytest.mark.parametrize("budget_ms", [100, 2000])
+def test_server_reports_decode_separately_without_extending_the_budget(
+    monkeypatch: pytest.MonkeyPatch,
+    budget_ms: int,
+) -> None:
+    now = [10.0]
+
+    class _TimedModel(_Model):
+        def __call__(self, inputs: dict[str, Any]) -> dict[str, np.ndarray]:
+            now[0] += 0.04
+            return super().__call__(inputs)
+
+    model = _TimedModel("decode-timing")
+    server = InferenceServer(model, "decode-timing")
+    payload = encode_predict_request(
+        {"images.top": np.zeros((1, 4, 4, 3), dtype=np.uint8)},
+        seq=1,
+        budget_ms=budget_ms,
+        image_codec="jpeg",
+        jpeg_quality=90,
+        max_image_side=None,
+    )
+
+    class _Query:
+        response: dict[str, Any] | None = None
+        error: dict[str, Any] | None = None
+
+        def reply(self, key: str, data: bytes) -> None:
+            self.response = decode_message(data)
+            server._stopping.set()  # noqa: SLF001
+
+        def reply_err(self, data: bytes) -> None:
+            self.error = decode_message(data)
+            server._stopping.set()  # noqa: SLF001
+
+    query = _Query()
+    query.payload = payload
+    original_decode = server_module.decode_predict_request
+
+    def timed_decode(*args: Any, **kwargs: Any) -> Any:
+        result = original_decode(*args, **kwargs)
+        now[0] += 0.3
+        return result
+
+    monkeypatch.setattr(server_module.time, "monotonic", lambda: now[0])
+    monkeypatch.setattr(server_module, "decode_predict_request", timed_decode)
+    server._on_query(query, "predict")  # noqa: SLF001
+    now[0] += 0.02
+    server._worker_loop()  # noqa: SLF001
+
+    if budget_ms == 100:
+        assert query.error is not None
+        assert query.error["code"] == "expired"
+        assert model.call_count == 0
+    else:
+        assert query.error is None
+        assert query.response is not None
+        assert query.response["server_queue_s"] == pytest.approx(0.02)
+        assert query.response["server_decode_s"] == pytest.approx(0.3)
+        assert query.response["server_compute_s"] == pytest.approx(0.04)
+
+
 def test_worker_expires_a_request_before_calling_the_model() -> None:
     class _Query:
         def __init__(self) -> None:
@@ -1075,6 +1163,7 @@ def test_client_uses_reliable_best_matching_queriers_for_all_requests(monkeypatc
                     server_id=server_id,
                     server_queue_s=0.0001,
                     server_compute_s=0.001,
+                    server_decode_s=0.003,
                 )
             else:
                 assert request == {"protocol_version": 1}
@@ -1102,6 +1191,7 @@ def test_client_uses_reliable_best_matching_queriers_for_all_requests(monkeypatc
         actions = client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
         timing = client.last_timing
         assert timing is not None
+        assert timing.server_decode_s == pytest.approx(0.003)
         assert timing.server_queue_s == pytest.approx(0.0001)
         assert timing.server_compute_s == pytest.approx(0.001)
         assert timing.encode_s >= 0

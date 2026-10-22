@@ -47,6 +47,7 @@ class _Request:
     received_at: float
     request_bytes: int
     inputs: dict[str, Any] | None = None
+    decoded_at: float | None = None
 
 
 class InferenceServer:
@@ -93,6 +94,7 @@ class InferenceServer:
         self._stopping = threading.Event()
         self._stop_event = threading.Event()
         self._queue_samples: deque[float] = deque(maxlen=_TIMING_SAMPLES)
+        self._decode_samples: deque[float] = deque(maxlen=_TIMING_SAMPLES)
         self._compute_samples: deque[float] = deque(maxlen=_TIMING_SAMPLES)
         self._counts = {"count": 0, "superseded": 0, "expired": 0}
         self._last_summary = 0.0
@@ -292,6 +294,7 @@ class InferenceServer:
                     received_at=received_at,
                     request_bytes=len(payload),
                     inputs=inputs,
+                    decoded_at=time.monotonic(),
                 )
                 self._enqueue(request)
                 return
@@ -310,6 +313,7 @@ class InferenceServer:
                     budget_ms=2**31 - 1,
                     received_at=received_at,
                     request_bytes=len(payload),
+                    decoded_at=time.monotonic(),
                 )
                 self._enqueue(request)
                 return
@@ -348,8 +352,11 @@ class InferenceServer:
                 if self._stopping.is_set() and not self._queue:
                     return
                 request = self._queue.popleft()
-            queue_ms = (time.monotonic() - request.received_at) * 1000
-            if queue_ms > request.budget_ms:
+            worker_started = time.monotonic()
+            decoded_at = request.decoded_at if request.decoded_at is not None else request.received_at
+            decode_ms = (decoded_at - request.received_at) * 1000
+            queue_ms = (worker_started - decoded_at) * 1000
+            if (worker_started - request.received_at) * 1000 > request.budget_ms:
                 self._counts["expired"] += 1
                 self._log_request(request, queue_ms, 0.0, "expired")
                 self._reply_error(request.query, request.seq, "expired")
@@ -374,10 +381,12 @@ class InferenceServer:
                         server_id=self._server_id,
                         server_queue_s=queue_ms / 1000,
                         server_compute_s=compute_ms / 1000,
+                        server_decode_s=decode_ms / 1000,
                     )
                 request.query.reply(self._key(request.command), response)
                 self._counts["count"] += 1
                 self._queue_samples.append(queue_ms)
+                self._decode_samples.append(decode_ms)
                 self._compute_samples.append(compute_ms)
                 self._log_request(request, queue_ms, compute_ms, "ok")
             except Exception:
@@ -385,6 +394,7 @@ class InferenceServer:
                 logger.exception("Remote inference model request failed (seq=%s)", request.seq)
                 self._counts["count"] += 1
                 self._queue_samples.append(queue_ms)
+                self._decode_samples.append(decode_ms)
                 self._compute_samples.append(compute_ms)
                 self._log_request(request, queue_ms, compute_ms, "model_error")
                 self._reply_error(request.query, request.seq, "model_error")
@@ -403,10 +413,12 @@ class InferenceServer:
             logger.debug("Unable to send remote inference error reply", exc_info=True)
 
     def _log_request(self, request: _Request, queue_ms: float, compute_ms: float, outcome: str) -> None:
+        decoded_at = request.decoded_at if request.decoded_at is not None else request.received_at
         logger.debug(
-            "Remote inference request seq=%s bytes=%s queue_ms=%.3f compute_ms=%.3f outcome=%s",
+            "Remote inference request seq=%s bytes=%s decode_ms=%.3f queue_ms=%.3f compute_ms=%.3f outcome=%s",
             request.seq,
             request.request_bytes,
+            (decoded_at - request.received_at) * 1000,
             queue_ms,
             compute_ms,
             outcome,
@@ -415,11 +427,15 @@ class InferenceServer:
     def _log_summary(self) -> None:
         self._last_summary = time.monotonic()
         queue = np.asarray(self._queue_samples, dtype=np.float64)
+        decode = np.asarray(self._decode_samples, dtype=np.float64)
         compute = np.asarray(self._compute_samples, dtype=np.float64)
         logger.info(
-            "Remote inference summary count=%d queue_ms_p50=%.3f queue_ms_p99=%.3f "
+            "Remote inference summary count=%d decode_ms_p50=%.3f decode_ms_p99=%.3f "
+            "queue_ms_p50=%.3f queue_ms_p99=%.3f "
             "compute_ms_p50=%.3f compute_ms_p99=%.3f superseded=%d expired=%d",
             self._counts["count"],
+            float(np.percentile(decode, 50)) if decode.size else 0.0,
+            float(np.percentile(decode, 99)) if decode.size else 0.0,
             float(np.percentile(queue, 50)) if queue.size else 0.0,
             float(np.percentile(queue, 99)) if queue.size else 0.0,
             float(np.percentile(compute, 50)) if compute.size else 0.0,

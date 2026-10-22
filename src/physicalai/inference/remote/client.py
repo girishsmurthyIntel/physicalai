@@ -390,6 +390,7 @@ class RemoteInferenceModel(InferenceModel):
                 round_trip_s=time.perf_counter() - round_trip_started,
                 server_queue_s=float(metadata["server_queue_s"]),
                 server_compute_s=float(metadata["server_compute_s"]),
+                server_decode_s=float(metadata["server_decode_s"]),
                 encode_s=encode_s,
                 decode_s=decode_s,
                 request_bytes=request_bytes,

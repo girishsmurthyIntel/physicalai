@@ -174,6 +174,22 @@ The client constructor performs no network I/O, so its configuration can be roun
 
 ## Failure Behavior
 
+### Request Timing
+
+After a successful prediction, `model.last_timing` reports durations in seconds:
+
+- `server_decode_s`: server-side request parsing, validation, and array/image decoding, including JPEG decoding.
+- `server_queue_s`: time from completed request decoding until the model worker starts processing the request.
+- `server_compute_s`: time spent executing the model.
+- `encode_s` and `decode_s`: client-side request encoding and reply decoding, respectively.
+- `round_trip_s`: client-observed total duration, including encoding, transport, server work, and reply decoding.
+
+Server debug logs and periodic summaries report decode, queue, and compute times
+separately in milliseconds. The request budget still starts at receipt: decoding
+does not extend the deadline. Replies from older servers without `server_decode_s`
+use `0.0` for that field; their `server_queue_s` retains the older combined
+decode-and-queue meaning.
+
 `request_timeout_s` defaults to 2 seconds and applies to the handshake and each request. The client does not retry failed model calls. Errors and timeouts propagate into the selected execution strategy: Sync raises in the control call, Async marks its worker failed and raises `WorkerDiedError` on a later tick, and RTC retries transient inference errors up to its consecutive-error limit.
 
 ## Troubleshooting

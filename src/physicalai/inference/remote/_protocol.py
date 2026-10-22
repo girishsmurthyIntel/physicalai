@@ -45,7 +45,11 @@ class RemoteInferenceModelMismatchError(RemoteInferenceError):
 
 @dataclass(frozen=True, slots=True)
 class RemoteTiming:
-    """Timing information for the last completed remote request."""
+    """Request timings with server decoding, post-decode queue wait, and compute split.
+
+    ``encode_s`` and ``decode_s`` measure client-side request encoding and reply
+    decoding; ``server_decode_s`` measures server-side request decoding.
+    """
 
     round_trip_s: float
     server_queue_s: float
@@ -54,6 +58,7 @@ class RemoteTiming:
     decode_s: float
     request_bytes: int
     reply_bytes: int
+    server_decode_s: float = 0.0
 
 
 def encode_message(message: dict[str, Any]) -> bytes:
@@ -336,6 +341,7 @@ def encode_predict_reply(
     server_id: str,
     server_queue_s: float,
     server_compute_s: float,
+    server_decode_s: float = 0.0,
 ) -> bytes:
     """Encode the complete model output map and server timing in a v1 reply."""
     return encode_message({
@@ -345,6 +351,7 @@ def encode_predict_reply(
         "outputs": outputs,
         "server_queue_s": server_queue_s,
         "server_compute_s": server_compute_s,
+        "server_decode_s": server_decode_s,
     })
 
 
@@ -361,7 +368,7 @@ def decode_predict_reply(payload: bytes) -> dict[str, Any]:
     }
     version = message.get("protocol_version")
     if (
-        set(message) != required
+        set(message) - {"server_decode_s"} != required
         or not isinstance(version, int)
         or isinstance(version, bool)
         or version != PROTOCOL_VERSION
@@ -377,7 +384,8 @@ def decode_predict_reply(payload: bytes) -> dict[str, Any]:
         raise RemoteInferenceProtocolError("Prediction outputs must be a string-keyed map")
     if any(not isinstance(value, np.ndarray) for value in outputs.values()):
         raise RemoteInferenceProtocolError("Prediction outputs must be NumPy arrays")
-    for field in ("server_queue_s", "server_compute_s"):
+    message.setdefault("server_decode_s", 0.0)
+    for field in ("server_decode_s", "server_queue_s", "server_compute_s"):
         value = message.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
             raise RemoteInferenceProtocolError(f"Prediction reply has invalid {field}")
