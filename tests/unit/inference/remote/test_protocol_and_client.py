@@ -14,10 +14,10 @@ import time
 from types import SimpleNamespace
 from typing import Any, cast
 
-import msgpack
 import numpy as np
 import pytest
 
+msgpack = pytest.importorskip("msgpack")
 zenoh = pytest.importorskip("zenoh")
 
 from physicalai.inference.constants import ACTION, PREV_CHUNK_LEFT_OVER, RTC_INFERENCE_DELAY  # noqa: E402
