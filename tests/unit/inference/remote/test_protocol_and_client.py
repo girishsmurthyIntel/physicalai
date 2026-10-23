@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import inspect
+import json
 import logging
 import socket
 import threading
@@ -144,7 +145,7 @@ def test_client_rejects_server_with_different_expected_policy() -> None:
         server_b.stop()
 
 
-def test_client_accepts_matching_policy_and_manifest_pins(tmp_path: Any) -> None:
+def test_client_checks_expected_policy_and_manifest_metadata(tmp_path: Any) -> None:
     manifest_bytes = b'{"policy":{"name":"pi05"}}'
     (tmp_path / "manifest.json").write_bytes(manifest_bytes)
     model = _Model("pi05")
@@ -237,10 +238,17 @@ def test_live_server_returns_invalid_request_without_exception_text() -> None:
             "inputs": {"state": {"__np__": True, "dtype": "float32", "shape": [2], "data": b"1234"}},
             "images": {},
         }),
+        encode_message({
+            "protocol_version": 1,
+            "seq": 43,
+            "budget_ms": 2**31,
+            "inputs": {},
+            "images": {},
+        }),
     ]
     try:
         client.connect()
-        for payload, seq in zip(malformed_payloads, (41, 42), strict=True):
+        for payload, seq in zip(malformed_payloads, (41, 42, 43), strict=True):
             reply = client._queriers["predict"].get(payload=payload).recv()  # noqa: SLF001
             assert reply.err is not None
             error = msgpack.unpackb(bytes(reply.err.payload), raw=False)
@@ -309,25 +317,58 @@ def test_client_rejects_protocol_version_mismatch() -> None:
         client._validate_handshake({"protocol_version": 2})  # noqa: SLF001
 
 
-def test_client_detects_server_restart_during_run() -> None:
+@pytest.mark.parametrize("replacement", ["same", "policy", "manifest"])
+def test_client_detects_server_restart_and_rechecks_identity_on_next_call(tmp_path: Any, replacement: str) -> None:
     name = "restart-detection"
     port = _free_port()
-    first_server = InferenceServer(_Model("pi05"), name, port=port)
+    manifest_bytes = b'{"policy":{"name":"pi05"}}'
+    manifest_path = tmp_path / "manifest.json"
+    manifest_path.write_bytes(manifest_bytes)
+    first_model = _Model("pi05")
+    first_model.export_dir = tmp_path
+    first_server = InferenceServer(first_model, name, port=port)
     first_server.start()
-    client = RemoteInferenceModel(name, port=port, request_timeout_s=1.0)
+    client = RemoteInferenceModel(
+        name,
+        port=port,
+        request_timeout_s=1.0,
+        expected_policy="pi05",
+        expected_manifest_sha256=hashlib.sha256(manifest_bytes).hexdigest(),
+    )
     second_server: InferenceServer | None = None
     try:
         client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
         first_id = client.metadata["server_id"]
+        client._action_buffer.append(np.ones(3, dtype=np.float32))  # noqa: SLF001
         first_server.stop()
 
-        second_server = InferenceServer(_Model("pi05"), name, port=port)
+        second_model = _Model("other-policy" if replacement == "policy" else "pi05")
+        second_model.export_dir = tmp_path
+        if replacement == "manifest":
+            manifest_path.write_bytes(b'{"policy":{"name":"pi05"},"revision":2}')
+        second_server = InferenceServer(second_model, name, port=port)
         second_server.start()
         assert second_server._server_id != first_id  # noqa: SLF001
         assert _wait_until(client._all_queries_match, 2.0)  # noqa: SLF001
 
         with pytest.raises(RemoteInferenceModelMismatchError, match="restarted or was replaced"):
             client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
+
+        assert client.metadata == {}
+        assert client.last_timing is None
+        assert not client._action_buffer  # noqa: SLF001
+        assert second_model.call_count == 1
+
+        if replacement == "same":
+            actions = client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
+            assert actions.shape == (4, 3)
+            assert client.metadata["server_id"] == second_server._server_id  # noqa: SLF001
+            assert second_model.call_count == 2
+        else:
+            expected_error = "Expected policy" if replacement == "policy" else "SHA-256"
+            with pytest.raises(RemoteInferenceModelMismatchError, match=expected_error):
+                client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
+            assert second_model.call_count == 1
     finally:
         client.close()
         first_server.stop()
@@ -428,10 +469,15 @@ def test_remote_model_default_request_timeout_is_two_seconds() -> None:
     assert timeout_parameter.default == 2.0
 
 
+def test_client_rejects_request_timeout_over_server_budget_limit() -> None:
+    with pytest.raises(ValueError, match="between 0.001 and 60 seconds"):
+        RemoteInferenceModel("timeout-budget-limit", request_timeout_s=60.001)
+
+
 def test_predict_timeout_is_typed_and_not_retried(monkeypatch: pytest.MonkeyPatch) -> None:
     class _TimeoutReceiver:
-        def recv(self) -> None:
-            raise RuntimeError("Timeout")
+        def recv(self) -> Any:
+            return SimpleNamespace(err=SimpleNamespace(payload=b"Timeout"), ok=None)
 
     class _Querier:
         get_count = 0
@@ -451,6 +497,31 @@ def test_predict_timeout_is_typed_and_not_retried(monkeypatch: pytest.MonkeyPatc
         client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
 
     assert querier.get_count == 1
+
+
+def test_client_rejects_an_unadvertised_image_codec() -> None:
+    name = "codec-negotiation"
+    client = RemoteInferenceModel(name, image_codec="raw")
+    metadata = InferenceServer(_Model(name), name)._build_metadata()  # noqa: SLF001
+    metadata["server_id"] = "test-server"
+    metadata["image_codecs"] = ["jpeg", "webp"]
+
+    with pytest.raises(RemoteInferenceProtocolError, match="does not advertise.*'raw'"):
+        client._validate_handshake(metadata)  # noqa: SLF001
+
+
+def test_client_rejects_request_over_server_limit_before_sending(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = RemoteInferenceModel("request-size-limit")
+    client._max_request_bytes = 1  # noqa: SLF001
+    monkeypatch.setattr(client, "connect", lambda: None)
+
+    def fail_if_sent(*args: Any, **kwargs: Any) -> Any:
+        raise AssertionError("oversized prediction must not be sent")
+
+    monkeypatch.setattr(client, "_receive_matching_reply", fail_if_sent)
+
+    with pytest.raises(RemoteInferenceProtocolError, match="exceeds server max_request_bytes"):
+        client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
 
 
 @pytest.mark.parametrize("name", ["", "..", "bad/name", "bad name", "bad*name", "$name"])
@@ -483,7 +554,6 @@ def test_server_name_and_policy_identity_remain_separate() -> None:
     assert metadata["policy"]["name"] == "pi05"
     assert metadata["policy"]["manifest_sha256"] == ""
     assert metadata["rtc"] == {"supported": True, "chunk_size": None}
-    assert metadata["cameras"] == []
     assert metadata["image_codecs"] == ["jpeg", "raw"]
     assert metadata["max_request_bytes"] == 32 * 2**20
     assert server._metadata_key == "physicalai/inference/cell1-act/metadata"  # noqa: SLF001
@@ -514,7 +584,6 @@ def test_metadata_reply_schema_and_manifest_hash_are_v1(tmp_path: Any) -> None:
         "policy",
         "chunk_size",
         "rtc",
-        "cameras",
         "image_codecs",
         "max_request_bytes",
     }
@@ -527,7 +596,6 @@ def test_metadata_reply_schema_and_manifest_hash_are_v1(tmp_path: Any) -> None:
         "device": "GPU",
     }
     assert metadata["rtc"] == {"supported": True, "chunk_size": 4}
-    assert metadata["cameras"] == [{"name": "wrist", "shape": [3, 480, 640]}]
     assert metadata["image_codecs"] == ["jpeg", "raw"]
 
 
@@ -548,6 +616,7 @@ def test_protocol_v1_message_schemas_are_direct_maps() -> None:
         server_id="server-id",
         server_queue_s=0.01,
         server_compute_s=0.02,
+        server_decode_s=0.0,
     )
 
     assert decode_message(metadata_request) == {"protocol_version": 1}
@@ -603,6 +672,7 @@ def test_decoded_request_and_reply_arrays_are_writable() -> None:
         server_id="test-server",
         server_queue_s=0.0,
         server_compute_s=0.0,
+        server_decode_s=0.0,
     )
     outputs = decode_predict_reply(reply)["outputs"]
 
@@ -614,7 +684,12 @@ def test_decoded_request_and_reply_arrays_are_writable() -> None:
 @pytest.mark.parametrize("decode_s", [None, True, -1.0, float("nan"), float("inf"), "0.1"])
 def test_predict_reply_rejects_invalid_server_decode_timing(decode_s: object) -> None:
     reply = encode_predict_reply(
-        {}, seq=1, server_id="timing-server", server_queue_s=0.0, server_compute_s=0.0,
+        {},
+        seq=1,
+        server_id="timing-server",
+        server_queue_s=0.0,
+        server_compute_s=0.0,
+        server_decode_s=0.0,
     )
     metadata = decode_message(reply)
     metadata["server_decode_s"] = decode_s
@@ -623,17 +698,15 @@ def test_predict_reply_rejects_invalid_server_decode_timing(decode_s: object) ->
         decode_predict_reply(encode_message(metadata))
 
 
-def test_predict_reply_accepts_legacy_timing_without_server_decode() -> None:
+def test_predict_reply_requires_server_decode_timing() -> None:
     reply = encode_predict_reply(
-        {}, seq=1, server_id="timing-server", server_queue_s=0.1, server_compute_s=0.2,
+        {}, seq=1, server_id="timing-server", server_queue_s=0.1, server_compute_s=0.2, server_decode_s=0.0,
     )
     metadata = decode_message(reply)
     del metadata["server_decode_s"]
 
-    decoded = decode_predict_reply(encode_message(metadata))
-
-    assert decoded["server_decode_s"] == 0.0
-    assert decoded["server_queue_s"] == 0.1
+    with pytest.raises(RemoteInferenceProtocolError, match="Malformed prediction reply"):
+        decode_predict_reply(encode_message(metadata))
 
 
 def test_predict_reply_preserves_the_full_model_output_map() -> None:
@@ -647,6 +720,7 @@ def test_predict_reply_preserves_the_full_model_output_map() -> None:
         server_id="test-server",
         server_queue_s=0.01,
         server_compute_s=0.02,
+        server_decode_s=0.0,
     )
     decoded = decode_predict_reply(reply)
 
@@ -809,6 +883,19 @@ def test_default_server_config_uses_peer_mode_and_one_listen_endpoint(monkeypatc
         "gossip_enabled": False,
     }
     assert inserted["transport/link/rx/max_message_size"] == str(32 * 2**20)
+    assert inserted["transport/shared_memory/enabled"] == "false"
+
+
+def test_server_disables_shared_memory_in_custom_config(tmp_path: Any) -> None:
+    config_path = tmp_path / "zenoh.json"
+    config_path.write_text(
+        json.dumps({"transport": {"shared_memory": {"enabled": True}}}), encoding="utf-8",
+    )
+    server = InferenceServer(_Model("custom-shm"), "custom-shm", zenoh_config=config_path)
+
+    config = server._build_config()  # noqa: SLF001
+
+    assert json.loads(config.get_json("transport/shared_memory/enabled")) is False
 
 
 def test_client_fails_unavailable_when_no_queryable_matches() -> None:
@@ -889,8 +976,8 @@ def test_new_predict_supersedes_the_only_pending_prediction() -> None:
     server.stop()
 
 
-@pytest.mark.parametrize("reset_count", [2, 3])
-def test_pending_resets_are_preserved_when_predictions_are_superseded(reset_count: int) -> None:
+@pytest.mark.parametrize("reset_count", [2, 3, 20_000])
+def test_reset_flood_keeps_only_the_latest_pending_reset_and_prediction(reset_count: int) -> None:
     class _Query:
         def __init__(self) -> None:
             self.error: bytes | None = None
@@ -907,19 +994,25 @@ def test_pending_resets_are_preserved_when_predictions_are_superseded(reset_coun
         server._enqueue(_Request(old_query, "predict", 10, 1000, now, 12, {}))  # noqa: SLF001
         for query in reset_queries:
             server._enqueue(_Request(query, "reset", -1, 1000, now, 12))  # noqa: SLF001
+            assert len(server._queue) <= 2  # noqa: SLF001
         server._enqueue(_Request(latest_query, "predict", 11, 1000, now, 12, {}))  # noqa: SLF001
 
-        assert all(query.error is None for query in reset_queries)
+        assert all(
+            query.error is not None and decode_message(query.error)["code"] == "superseded"
+            for query in reset_queries[:-1]
+        )
+        assert reset_queries[-1].error is None
         assert latest_query.error is None
         assert old_query.error is not None
         assert decode_message(old_query.error)["code"] == "superseded"
-        assert [request.query for request in server._queue] == [*reset_queries, latest_query]  # noqa: SLF001
-        assert server._counts["superseded"] == 1  # noqa: SLF001
+        assert [request.query for request in server._queue] == [reset_queries[-1], latest_query]  # noqa: SLF001
+        assert server._counts["superseded"] == reset_count  # noqa: SLF001
     finally:
         server.stop()
 
 
-def test_live_newest_wins_supersedes_pending_request_while_worker_is_busy() -> None:
+@pytest.mark.parametrize("command", ["predict", "reset"])
+def test_live_newest_wins_supersedes_pending_request_while_worker_is_busy(command: str) -> None:
     class _BlockingModel(_Model):
         def __init__(self) -> None:
             super().__init__("pi05")
@@ -935,7 +1028,14 @@ def test_live_newest_wins_supersedes_pending_request_while_worker_is_busy() -> N
                     raise TimeoutError("test did not release running predict")
             return {ACTION: np.full((1, 4, 3), call_number, dtype=np.float32)}
 
-    name = "newest-wins-live"
+        def reset(self) -> None:
+            super().reset()
+            if self.reset_count == 1:
+                self.first_started.set()
+                if not self.release_first.wait(3.0):
+                    raise TimeoutError("test did not release running reset")
+
+    name = f"newest-wins-live-{command}"
     model = _BlockingModel()
     server = InferenceServer(model, name, port=_free_port())
     server.start()
@@ -946,7 +1046,10 @@ def test_live_newest_wins_supersedes_pending_request_while_worker_is_busy() -> N
 
     def request(label: str, client: RemoteInferenceModel) -> None:
         try:
-            results[label] = client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
+            if command == "reset":
+                client.reset()
+            else:
+                results[label] = client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
         except BaseException as error:
             errors[label] = error
         finally:
@@ -971,14 +1074,18 @@ def test_live_newest_wins_supersedes_pending_request_while_worker_is_busy() -> N
         assert "superseded" in str(errors["pending"]).lower()
         assert server._counts["superseded"] == 1  # noqa: SLF001
         assert len(server._queue) == 1  # noqa: SLF001
+        assert not completed["running"].is_set()
 
         model.release_first.set()
         assert completed["running"].wait(2.0)
         assert completed["newest"].wait(2.0)
         assert set(errors) == {"pending"}
-        assert model.call_count == 2
-        np.testing.assert_array_equal(results["running"], np.ones((4, 3), dtype=np.float32))
-        np.testing.assert_array_equal(results["newest"], np.full((4, 3), 2, dtype=np.float32))
+        if command == "reset":
+            assert model.reset_count == 2
+        else:
+            assert model.call_count == 2
+            np.testing.assert_array_equal(results["running"], np.ones((4, 3), dtype=np.float32))
+            np.testing.assert_array_equal(results["newest"], np.full((4, 3), 2, dtype=np.float32))
     finally:
         model.release_first.set()
         for thread in threads:
@@ -1052,6 +1159,40 @@ def test_server_reports_decode_separately_without_extending_the_budget(
         assert query.response["server_compute_s"] == pytest.approx(0.04)
 
 
+@pytest.mark.parametrize("counter", ["count", "superseded", "expired"])
+def test_server_summary_skips_unchanged_intervals(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    counter: str,
+) -> None:
+    now = [0.0]
+    monkeypatch.setattr(server_module.time, "monotonic", lambda: now[0])
+    server = InferenceServer(_Model("summary-idle"), "summary-idle")
+    interval = server_module._SUMMARY_INTERVAL_S  # noqa: SLF001
+
+    with caplog.at_level(logging.INFO, logger="physicalai.inference.remote.server"):
+        now[0] = interval
+        server._maybe_log_summary()  # noqa: SLF001
+        assert not caplog.records
+        assert server._last_summary == now[0]  # noqa: SLF001
+
+        server._counts[counter] += 1  # noqa: SLF001
+        now[0] += interval
+        server._maybe_log_summary()  # noqa: SLF001
+        assert len(caplog.records) == 1
+        assert "Remote inference summary" in caplog.records[0].message
+
+        now[0] += interval
+        server._maybe_log_summary()  # noqa: SLF001
+        assert len(caplog.records) == 1
+        assert server._last_summary == now[0]  # noqa: SLF001
+
+        server._counts[counter] += 1  # noqa: SLF001
+        now[0] += interval
+        server._maybe_log_summary()  # noqa: SLF001
+        assert len(caplog.records) == 2
+
+
 def test_worker_expires_a_request_before_calling_the_model() -> None:
     class _Query:
         def __init__(self) -> None:
@@ -1104,6 +1245,20 @@ def test_reset_roundtrip_runs_on_the_server_worker() -> None:
     finally:
         client.close()
         server.stop()
+
+
+def test_stop_wakes_serve_forever() -> None:
+    server = InferenceServer(_Model("serve-forever-stop"), "serve-forever-stop", port=_free_port())
+    serving_thread = threading.Thread(target=server.serve_forever, daemon=True)
+    serving_thread.start()
+    try:
+        assert server._started.wait(2.0)  # noqa: SLF001
+        server.stop()
+        serving_thread.join(timeout=2.0)
+        assert not serving_thread.is_alive()
+    finally:
+        server.stop()
+        serving_thread.join(timeout=2.0)
 
 
 def test_predict_querier_can_be_reused() -> None:
@@ -1164,9 +1319,7 @@ def test_client_uses_reliable_best_matching_queriers_for_all_requests(monkeypatc
                         },
                         "chunk_size": 4,
                         "rtc": {"supported": False, "chunk_size": None},
-                        "cameras": [],
-                        "image_codecs": ["jpeg", "raw"],
-                        "max_request_bytes": 32 * 2**20,
+                        "image_codecs": ["jpeg", "raw", "webp"],
                     },
                 )
             elif self.key.endswith("/predict"):
@@ -1202,6 +1355,7 @@ def test_client_uses_reliable_best_matching_queriers_for_all_requests(monkeypatc
     client = RemoteInferenceModel(name, port=14568, request_timeout_s=0.5)
     try:
         client.connect()
+        assert client._max_request_bytes == 32 * 2**20  # noqa: SLF001
         actions = client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
         timing = client.last_timing
         assert timing is not None
@@ -1231,12 +1385,98 @@ def test_client_uses_reliable_best_matching_queriers_for_all_requests(monkeypatc
     assert actions.shape == (4, 3)
 
 
-def test_client_predict_guard_rejects_overlapping_in_flight_request() -> None:
-    client = RemoteInferenceModel("in-flight-guard", port=14569)
-    client._predict_in_flight = True  # noqa: SLF001
+@pytest.mark.parametrize("use_chunk_helper", [False, True])
+def test_public_predictions_hold_the_client_lock(monkeypatch: pytest.MonkeyPatch, use_chunk_helper: bool) -> None:
+    client = RemoteInferenceModel("locked-predictions")
+    acquired: list[bool] = []
 
-    with pytest.raises(RemoteInferenceError, match="already in flight"):
-        client._predict({"state": np.zeros(3, dtype=np.float32)})  # noqa: SLF001
+    def probe_lock() -> None:
+        available = client._lock.acquire(blocking=False)  # noqa: SLF001
+        acquired.append(available)
+        if available:
+            client._lock.release()  # noqa: SLF001
+
+    def predict(inputs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
+        worker = threading.Thread(target=probe_lock)
+        worker.start()
+        worker.join(timeout=1.0)
+        assert not worker.is_alive()
+        assert acquired == [False]
+        return {}, {ACTION: np.ones((4, 3), dtype=np.float32)}
+
+    monkeypatch.setattr(client, "connect", lambda: None)
+    monkeypatch.setattr(client, "_predict", predict)
+    client._metadata = {"chunk_size": 4, "rtc": {"supported": False}}  # noqa: SLF001
+    observation = {"state": np.zeros(3, dtype=np.float32)}
+    actions = client.predict_action_chunk(observation) if use_chunk_helper else client(observation)[ACTION]
+
+    assert actions.shape == (4, 3)
+
+
+@pytest.mark.parametrize("shape", [(3,), (4, 3), (1, 4, 3)])
+def test_client_inherits_action_helpers_and_clears_the_buffer_on_reset_and_close(shape: tuple[int, ...]) -> None:
+    assert RemoteInferenceModel.predict_action_chunk is InferenceModel.predict_action_chunk
+    assert RemoteInferenceModel.select_action is InferenceModel.select_action
+    actions = np.arange(int(np.prod(shape)), dtype=np.float32).reshape(shape)
+
+    class _ActionModel(_Model):
+        def __call__(self, inputs: dict[str, Any]) -> dict[str, np.ndarray]:
+            self.call_count += 1
+            return {ACTION: actions}
+
+    name = "inherited-action-helpers"
+    model = _ActionModel(name)
+    server = InferenceServer(model, name, port=_free_port())
+    server.start()
+    client = RemoteInferenceModel(name, port=server.port)
+    observation = {"state": np.zeros(3, dtype=np.float32)}
+    expected = np.atleast_2d(actions[0] if actions.ndim == 3 else actions)
+    try:
+        np.testing.assert_array_equal(client.predict_action_chunk(observation), expected)
+        assert model.call_count == 1
+        for action in expected:
+            np.testing.assert_array_equal(client.select_action(observation), action)
+        assert model.call_count == 2
+
+        client.select_action(observation)
+        assert model.call_count == 3
+        client.reset()
+        assert model.reset_count == 1
+        assert not client._action_buffer  # noqa: SLF001
+
+        np.testing.assert_array_equal(client.select_action(observation), expected[0])
+        assert model.call_count == 4
+        client.close()
+        assert not client._action_buffer  # noqa: SLF001
+    finally:
+        client.close()
+        server.stop()
+
+
+@pytest.mark.parametrize(
+    ("actions", "error_match"),
+    [
+        (np.full((4, 3), np.nan, dtype=np.float32), "finite"),
+        (np.full((4, 3), np.inf, dtype=np.float32), "finite"),
+        (np.ones((4, 3), dtype=np.int32), "floating-point"),
+        (np.ones((5, 3), dtype=np.float32), "exceeds advertised chunk_size"),
+    ],
+)
+def test_client_rejects_invalid_action_outputs_from_server(actions: np.ndarray, error_match: str) -> None:
+    class _InvalidActionModel(_Model):
+        def __call__(self, inputs: dict[str, Any]) -> dict[str, np.ndarray]:
+            return {ACTION: actions}
+
+    name = "invalid-action-output"
+    server = InferenceServer(_InvalidActionModel(name), name, port=_free_port())
+    server.start()
+    client = RemoteInferenceModel(name, port=server.port)
+    try:
+        with pytest.raises(RemoteInferenceProtocolError, match=error_match):
+            client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
+    finally:
+        client.close()
+        server.stop()
 
 
 def test_client_rejects_action_batch_larger_than_one() -> None:
@@ -1249,7 +1489,7 @@ def test_client_rejects_action_batch_larger_than_one() -> None:
     server.start()
     client = RemoteInferenceModel(name, port=server.port)
     try:
-        with pytest.raises(RemoteInferenceProtocolError, match="batch size 1"):
+        with pytest.raises(ValueError, match="expected batch dimension of 1"):
             client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)})
     finally:
         client.close()

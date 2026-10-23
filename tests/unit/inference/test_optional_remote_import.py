@@ -92,12 +92,8 @@ def test_inference_package_imports_without_zenoh() -> None:
         assert runtime.SyncExecution is not None
         assert "RemoteInferenceModel" not in runtime.__all__
         assert "InferenceServer" not in runtime.__all__
-        try:
-            runtime.RemoteInferenceModel
-        except ModuleNotFoundError as error:
-            assert "simulated missing optional zenoh dependency" in str(error)
-        else:
-            raise AssertionError("remote runtime export should require Zenoh")
+        assert not hasattr(runtime, "RemoteInferenceModel")
+        assert not hasattr(runtime, "InferenceServer")
         """
     )
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, check=False)

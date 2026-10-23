@@ -26,7 +26,7 @@ from physicalai.transport import derive_port, endpoint_for_key, make_zenoh_confi
 from ._protocol import (
     DEFAULT_IMAGE_JPEG_QUALITY,
     DEFAULT_MAX_REQUEST_BYTES,
-    MAX_IMAGE_JPEG_QUALITY,
+    MAX_REQUEST_BUDGET_MS,
     PROTOCOL_VERSION,
     ImageCodec,
     RemoteInferenceError,
@@ -40,11 +40,11 @@ from ._protocol import (
     decode_predict_reply,
     encode_message,
     encode_predict_request,
+    validate_image_options,
 )
 
 logger = logging.getLogger(__name__)
-_ACTION_NDIM = 2
-_BATCHED_ACTION_NDIM = 3
+_ACTION_TIME_AXIS_NDIM = 2
 
 
 @export_config(class_path="physicalai.inference.RemoteInferenceModel")
@@ -72,28 +72,15 @@ class RemoteInferenceModel(InferenceModel):
             ValueError: If a name, address, timeout, or image option is invalid.
         """
         self._key_prefix = model_key_prefix(name)
+        validate_image_options(image_codec, jpeg_quality, max_image_side)
         if (
             isinstance(request_timeout_s, bool)
             or not math.isfinite(request_timeout_s)
             or request_timeout_s <= 0
             or int(request_timeout_s * 1000) < 1
+            or request_timeout_s > MAX_REQUEST_BUDGET_MS / 1000
         ):
-            msg = "request_timeout_s must be finite and at least 0.001 seconds"
-            raise ValueError(msg)
-        if image_codec not in {"jpeg", "raw"}:
-            msg = "image_codec must be 'jpeg' or 'raw'"
-            raise ValueError(msg)
-        if (
-            not isinstance(jpeg_quality, int)
-            or isinstance(jpeg_quality, bool)
-            or not 0 <= jpeg_quality <= MAX_IMAGE_JPEG_QUALITY
-        ):
-            msg = "jpeg_quality must be between 0 and 100"
-            raise ValueError(msg)
-        if max_image_side is not None and (
-            not isinstance(max_image_side, int) or isinstance(max_image_side, bool) or max_image_side < 1
-        ):
-            msg = "max_image_side must be positive"
+            msg = "request_timeout_s must be between 0.001 and 60 seconds"
             raise ValueError(msg)
         if expected_policy is not None and not isinstance(expected_policy, str):
             msg = "expected_policy must be a string or None"
@@ -138,7 +125,7 @@ class RemoteInferenceModel(InferenceModel):
         self._server_id: str | None = None
         self._last_timing: RemoteTiming | None = None
         self._action_buffer: deque[np.ndarray] = deque()
-        self._predict_in_flight = False
+        self._max_request_bytes = DEFAULT_MAX_REQUEST_BYTES
 
     def connect(self) -> None:
         """Open the session, declare queriers, and validate the server handshake.
@@ -228,42 +215,34 @@ class RemoteInferenceModel(InferenceModel):
 
         Returns:
             The complete model output map.
+
         """
         with self._lock:
             self.connect()
             _, outputs = self._predict(inputs)
+            self._validate_action_output(outputs)
             return outputs
 
-    def predict_action_chunk(self, observation: dict[str, Any]) -> np.ndarray:
-        """Return a two-dimensional action chunk, stripping a singleton batch.
+    def _validate_action_output(self, outputs: dict[str, np.ndarray]) -> None:
+        """Reject malformed action arrays before exposing them to callers.
 
         Raises:
-            RemoteInferenceProtocolError: If the output is missing actions or has an invalid shape.
+            RemoteInferenceProtocolError: If action values, dtype, or chunk length are invalid.
         """
-        with self._lock:
-            self.connect()
-            _, outputs = self._predict(observation)
-            if ACTION not in outputs:
-                msg = "Remote response has no action output"
-                raise RemoteInferenceProtocolError(msg)
-            actions = outputs[ACTION]
-            if actions.ndim == _BATCHED_ACTION_NDIM:
-                if actions.shape[0] != 1:
-                    msg = f"Batched action inference requires batch size 1, got {actions.shape[0]}"
-                    raise RemoteInferenceProtocolError(msg)
-                actions = actions[0]
-            actions = np.atleast_2d(actions)
-            if actions.ndim != _ACTION_NDIM:
-                msg = f"Expected a 2-D action chunk, got shape {actions.shape}"
-                raise RemoteInferenceProtocolError(msg)
-            return actions
-
-    def select_action(self, observation: dict[str, Any]) -> np.ndarray:
-        """Return the next action from a locally buffered action chunk."""
-        with self._lock:
-            if not self._action_buffer:
-                self._action_buffer.extend(self.predict_action_chunk(observation))
-            return self._action_buffer.popleft()
+        actions = outputs.get(ACTION)
+        if actions is None:
+            return
+        if actions.dtype.kind != "f":
+            msg = f"Remote action output must use a floating-point dtype, got {actions.dtype}"
+            raise RemoteInferenceProtocolError(msg)
+        if not np.isfinite(actions).all():
+            msg = "Remote action output must contain only finite values"
+            raise RemoteInferenceProtocolError(msg)
+        action_count = actions.shape[-_ACTION_TIME_AXIS_NDIM] if actions.ndim >= _ACTION_TIME_AXIS_NDIM else 1
+        chunk_size = self.chunk_size
+        if action_count > chunk_size:
+            msg = f"Remote action chunk length {action_count} exceeds advertised chunk_size {chunk_size}"
+            raise RemoteInferenceProtocolError(msg)
 
     def reset(self) -> None:
         """Reset the remote policy on the model-owning server worker."""
@@ -334,11 +313,6 @@ class RemoteInferenceModel(InferenceModel):
         """Timing information for the most recent completed request."""
         return self._last_timing
 
-    @property
-    def last_server_latency_s(self) -> float | None:
-        """Compatibility view used by existing execution latency trackers."""
-        return self._last_timing.server_compute_s if self._last_timing is not None else None
-
     def _all_queries_match(self) -> bool:
         for querier in self._queriers.values():
             status = querier.matching_status
@@ -381,18 +355,15 @@ class RemoteInferenceModel(InferenceModel):
         ):
             msg = "Server metadata has an invalid RTC chunk_size"
             raise RemoteInferenceProtocolError(msg)
-        if not isinstance(metadata.get("cameras"), list) or any(
-            not isinstance(camera, dict)
-            or not isinstance(camera.get("name"), str)
-            or not isinstance(camera.get("shape"), list)
-            for camera in metadata["cameras"]
+        image_codecs = metadata.get("image_codecs", ["jpeg", "raw"])
+        if (
+            not isinstance(image_codecs, list)
+            or any(not isinstance(codec, str) for codec in image_codecs)
+            or self._image_codec not in image_codecs
         ):
-            msg = "Server metadata has invalid camera information"
+            msg = f"Server does not advertise the configured image codec {self._image_codec!r}"
             raise RemoteInferenceProtocolError(msg)
-        if metadata.get("image_codecs") != ["jpeg", "raw"]:
-            msg = "Server metadata has invalid image codecs"
-            raise RemoteInferenceProtocolError(msg)
-        max_request_bytes = metadata.get("max_request_bytes")
+        max_request_bytes = metadata.get("max_request_bytes", DEFAULT_MAX_REQUEST_BYTES)
         if not isinstance(max_request_bytes, int) or isinstance(max_request_bytes, bool) or max_request_bytes < 1:
             msg = "Server metadata has invalid max_request_bytes"
             raise RemoteInferenceProtocolError(msg)
@@ -402,9 +373,10 @@ class RemoteInferenceModel(InferenceModel):
         if self._expected_manifest_sha256 is not None and policy["manifest_sha256"] != self._expected_manifest_sha256:
             msg = "Remote manifest SHA-256 does not match the expected value"
             raise RemoteInferenceModelMismatchError(msg)
+        self._max_request_bytes = max_request_bytes
 
     def _query_metadata(self, payload: bytes) -> dict[str, Any]:
-        reply = self._receive_matching_reply("metadata", payload, None)
+        reply = self._receive_matching_reply("metadata", payload)
         if reply.err is not None:
             self._raise_remote_error(bytes(reply.err.payload), None)
         if reply.ok is None:
@@ -413,51 +385,47 @@ class RemoteInferenceModel(InferenceModel):
         return decode_message(bytes(reply.ok.payload))
 
     def _predict(self, inputs: dict[str, Any]) -> tuple[dict[str, Any], dict[str, np.ndarray]]:
-        if self._predict_in_flight:
-            msg = "A prediction request is already in flight for this client"
-            raise RemoteInferenceError(msg)
-        self._predict_in_flight = True
-        try:
-            self._last_timing = None
-            round_trip_started = time.perf_counter()
-            seq = self._next_seq()
-            encode_started = time.perf_counter()
-            payload = encode_predict_request(
-                inputs,
-                seq=seq,
-                budget_ms=int(self._request_timeout_s * 1000),
-                image_codec=self._image_codec,
-                jpeg_quality=self._jpeg_quality,
-                max_image_side=self._max_image_side,
-            )
-            encode_s = time.perf_counter() - encode_started
-            request_bytes = len(payload)
-            reply = self._receive_matching_reply("predict", payload, seq)
-            if reply.err is not None:
-                self._raise_remote_error(bytes(reply.err.payload), seq)
-            if reply.ok is None:
-                msg = "Prediction query returned an empty reply"
-                raise RemoteInferenceProtocolError(msg)
-            reply_payload = bytes(reply.ok.payload)
-            decode_started = time.perf_counter()
-            metadata = decode_predict_reply(reply_payload)
-            decode_s = time.perf_counter() - decode_started
-            self._validate_response(metadata, seq)
-            self._last_timing = RemoteTiming(
-                round_trip_s=time.perf_counter() - round_trip_started,
-                server_queue_s=float(metadata["server_queue_s"]),
-                server_compute_s=float(metadata["server_compute_s"]),
-                server_decode_s=float(metadata["server_decode_s"]),
-                encode_s=encode_s,
-                decode_s=decode_s,
-                request_bytes=request_bytes,
-                reply_bytes=len(reply_payload),
-            )
-            return metadata, metadata["outputs"]
-        finally:
-            self._predict_in_flight = False
+        self._last_timing = None
+        round_trip_started = time.perf_counter()
+        seq = self._next_seq()
+        encode_started = time.perf_counter()
+        payload = encode_predict_request(
+            inputs,
+            seq=seq,
+            budget_ms=int(self._request_timeout_s * 1000),
+            image_codec=self._image_codec,
+            jpeg_quality=self._jpeg_quality,
+            max_image_side=self._max_image_side,
+        )
+        if len(payload) > self._max_request_bytes:
+            msg = f"Encoded request exceeds server max_request_bytes ({self._max_request_bytes})"
+            raise RemoteInferenceProtocolError(msg)
+        encode_s = time.perf_counter() - encode_started
+        request_bytes = len(payload)
+        reply = self._receive_matching_reply("predict", payload)
+        if reply.err is not None:
+            self._raise_remote_error(bytes(reply.err.payload), seq)
+        if reply.ok is None:
+            msg = "Prediction query returned an empty reply"
+            raise RemoteInferenceProtocolError(msg)
+        reply_payload = bytes(reply.ok.payload)
+        decode_started = time.perf_counter()
+        metadata = decode_predict_reply(reply_payload)
+        decode_s = time.perf_counter() - decode_started
+        self._validate_response(metadata, seq)
+        self._last_timing = RemoteTiming(
+            round_trip_s=time.perf_counter() - round_trip_started,
+            server_queue_s=float(metadata["server_queue_s"]),
+            server_compute_s=float(metadata["server_compute_s"]),
+            server_decode_s=float(metadata["server_decode_s"]),
+            encode_s=encode_s,
+            decode_s=decode_s,
+            request_bytes=request_bytes,
+            reply_bytes=len(reply_payload),
+        )
+        return metadata, metadata["outputs"]
 
-    def _receive_matching_reply(self, name: str, payload: bytes, seq: int | None) -> zenoh.Reply:
+    def _receive_matching_reply(self, name: str, payload: bytes) -> zenoh.Reply:
         if self._session is None:
             msg = "Remote inference session is not connected"
             raise RemoteInferenceUnavailableError(msg)
@@ -466,36 +434,18 @@ class RemoteInferenceModel(InferenceModel):
             msg = f"Remote inference querier {name!r} is not declared"
             raise RemoteInferenceUnavailableError(msg)
         receiver = querier.get(payload=payload)
-        while True:
-            try:
-                reply = receiver.recv()
-            except Exception as error:
-                if "timeout" in str(error).lower():
-                    msg = f"Remote inference request {seq} timed out after {self._request_timeout_s:.3f}s"
-                    raise RemoteInferenceTimeoutError(msg) from error
-                msg = f"Remote inference query failed: {error}"
-                raise RemoteInferenceUnavailableError(msg) from error
-            if reply is None:
-                msg = f"Remote inference request {seq} timed out"
-                raise RemoteInferenceTimeoutError(msg)
-            if reply.err is not None:
-                error_payload = bytes(reply.err.payload)
-                if error_payload.strip().lower() == b"timeout":
-                    msg = (
-                        f"Remote inference request {seq if seq is not None else name} timed out "
-                        f"after {self._request_timeout_s:.3f}s"
-                    )
-                    raise RemoteInferenceTimeoutError(msg)
-                error_metadata = decode_error(error_payload)
-                if seq is not None and error_metadata.get("seq") != seq:
-                    continue
-                return reply
-            if reply.ok is None:
-                continue
-            message = decode_message(bytes(reply.ok.payload))
-            if seq is not None and message.get("seq") != seq:
-                continue
-            return reply
+        try:
+            reply = receiver.recv()
+        except zenoh.ZError as error:
+            msg = f"Remote inference query failed: {error}"
+            raise RemoteInferenceUnavailableError(msg) from error
+        if reply is None:
+            msg = f"Remote inference request {name} timed out after {self._request_timeout_s:.3f}s"
+            raise RemoteInferenceTimeoutError(msg)
+        if reply.err is not None and bytes(reply.err.payload) == b"Timeout":
+            msg = f"Remote inference request {name} timed out after {self._request_timeout_s:.3f}s"
+            raise RemoteInferenceTimeoutError(msg)
+        return reply
 
     def _validate_response(self, metadata: dict[str, Any], seq: int) -> None:
         version = metadata.get("protocol_version")
@@ -513,11 +463,12 @@ class RemoteInferenceModel(InferenceModel):
                 raise RemoteInferenceProtocolError(msg)
         server_id = metadata.get("server_id")
         if not isinstance(server_id, str) or server_id != self._server_id:
+            self._close_locked()
             msg = "Inference server restarted or was replaced"
             raise RemoteInferenceModelMismatchError(msg)
 
     def _send(self, name: str, payload: bytes, seq: int | None) -> dict[str, Any]:
-        reply = self._receive_matching_reply(name, payload, seq)
+        reply = self._receive_matching_reply(name, payload)
         if reply.err is not None:
             self._raise_remote_error(bytes(reply.err.payload), seq)
         if reply.ok is None:
@@ -580,3 +531,6 @@ class RemoteInferenceModel(InferenceModel):
                 self._session = None
         self._server_id = None
         self._metadata = {}
+        self._action_buffer.clear()
+        self._last_timing = None
+        self._max_request_bytes = DEFAULT_MAX_REQUEST_BYTES

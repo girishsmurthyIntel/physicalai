@@ -1,5 +1,9 @@
 # Run Inference Remotely over Zenoh
 
+The server disables Zenoh shared memory, including when a custom `zenoh_config`
+is supplied. Same-host clients use TCP rather than shared-memory segments, so
+repeated short-lived client processes do not depend on retained segment mappings.
+
 Use a `RemoteInferenceModel` on the robot client and a normal exported `InferenceModel` on the inference server. Choose `SyncExecution`, `AsyncExecution`, or `RTCExecution` independently in the client runtime configuration.
 
 Choose an explicit deployment-slot name, independently of the model policy and host, and use it on both client and server. For example, two servers running `pi05` can be named `cell1-act` and `cell2-act`. Zenoh keys are scoped below `physicalai/inference/{name}`, and the default TCP port is derived from that namespace. Both Python constructors accept `host` (default `127.0.0.1`) and optional `port`; Zenoh endpoint strings are internal. At startup, the client connects to that host and port with multicast and gossip disabled, then checks the protocol version, policy identity, and server identity in a handshake.
@@ -172,7 +176,29 @@ uv run physicalai run --config policy_runtime_remote_zenoh.yaml --run.duration_s
 
 The client constructor performs no network I/O, so its configuration can be round-tripped through YAML. Protocol v1 uses MessagePack maps and shared tagged NumPy arrays; RGB images use JPEG by default and can use exact raw bytes with `image_codec: raw`.
 
+During the handshake, the client verifies that its configured `image_codec` is
+advertised by the server while tolerating additional codecs from newer servers.
+It also enforces the server's advertised `max_request_bytes` before sending a
+prediction. Returned `action` arrays must have a floating-point dtype, contain
+only finite values, and not exceed the advertised chunk size. Camera descriptors
+are not part of the handshake metadata.
+
 ## Failure Behavior
+
+If a prediction reply identifies a restarted or replaced server, that call raises
+`RemoteInferenceModelMismatchError`. The client closes its stale connection and
+clears cached actions, metadata, and timing. The next call re-handshakes and
+rechecks `expected_policy` and `expected_manifest_sha256` as configuration
+consistency guards before sending a new prediction. The manifest hash is
+self-reported by the server and does not authenticate it or prove artifact
+integrity. The detecting call is never automatically replayed; this permits
+client reuse, not automatic recovery of a failed runtime execution worker.
+
+The server keeps at most one pending prediction and one pending reset. A newer
+request replaces an older pending request of the same kind, which receives a
+`superseded` error rather than a success acknowledgement. Requests already
+executing on the model worker are not cancelled. This bounds pending reset
+queries even when a client sends resets without waiting for replies.
 
 ### Request Timing
 
@@ -185,22 +211,26 @@ After a successful prediction, `model.last_timing` reports durations in seconds:
 - `round_trip_s`: client-observed total duration, including encoding, transport, server work, and reply decoding.
 
 Server debug logs and periodic summaries report decode, queue, and compute times
-separately in milliseconds. The request budget still starts at receipt: decoding
-does not extend the deadline. Replies from older servers without `server_decode_s`
-use `0.0` for that field; their `server_queue_s` retains the older combined
-decode-and-queue meaning.
+separately in milliseconds. Summaries are skipped when request, supersession, and
+expiration counts have not changed since the previous summary interval.
+The request budget still starts at receipt: decoding
+does not extend the deadline. The current protocol requires `server_decode_s` in
+every prediction reply; update the client and server together.
 
-`request_timeout_s` defaults to 2 seconds and applies to the handshake and each request. The client does not retry failed model calls. Errors and timeouts propagate into the selected execution strategy: Sync raises in the control call, Async marks its worker failed and raises `WorkerDiedError` on a later tick, and RTC retries transient inference errors up to its consecutive-error limit.
+`request_timeout_s` defaults to 2 seconds and applies to the handshake and each request. Prediction budgets are capped at 60 seconds on both client and server; oversized wire budgets are rejected before entering the worker queue. The client does not retry failed model calls. Errors and timeouts propagate into the selected execution strategy: Sync raises in the control call, Async marks its worker failed and raises `WorkerDiedError` on a later tick, and RTC retries transient inference errors up to its consecutive-error limit.
 
 ## Troubleshooting
 
-| Symptom                             | Check                                                                                                                                                                               |
-| ----------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| No matching server                  | Confirm the server process is running with the same `--name`; run `physicalai inference port NAME` on both ends and compare the derived port.                                       |
-| SSH tunnel down                     | Restart `ssh -N -L P:127.0.0.1:P user@inference-host` on the client and keep it open; test the local forwarded port with `nc -vz 127.0.0.1 P`.                                      |
-| Firewall blocks a direct connection | Allow inbound TCP `P` only from trusted client addresses in the host and cloud firewalls; verify with `nc -vz SERVER_IP P`.                                                         |
-| Port already in use                 | The server exits without selecting another port. Choose another `--name` or explicit `--port`, then update the client's `name` or `port` to match.                                  |
-| Model mismatch                      | Compare the server's policy name and manifest SHA-256 with any client `expected_policy` / `expected_manifest_sha256` pins; ensure the export on the server is the intended version. |
+| Symptom                             | Check                                                                                                                                              |
+| ----------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| No matching server                  | Confirm the server process is running with the same `--name`; run `physicalai inference port NAME` on both ends and compare the derived port.      |
+| SSH tunnel down                     | Restart `ssh -N -L P:127.0.0.1:P user@inference-host` on the client and keep it open; test the local forwarded port with `nc -vz 127.0.0.1 P`.     |
+| Firewall blocks a direct connection | Allow inbound TCP `P` only from trusted client addresses in the host and cloud firewalls; verify with `nc -vz SERVER_IP P`.                        |
+| Port already in use                 | The server exits without selecting another port. Choose another `--name` or explicit `--port`, then update the client's `name` or `port` to match. |
+
+For a model mismatch, compare the server's policy name and reported manifest
+hash with the client's expected values. These are consistency checks, not server
+authentication or artifact-integrity checks.
 
 ## Trust Boundary
 

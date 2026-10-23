@@ -102,11 +102,11 @@ class InferenceServer:
         self._worker: threading.Thread | None = None
         self._started = threading.Event()
         self._stopping = threading.Event()
-        self._stop_event = threading.Event()
         self._queue_samples: deque[float] = deque(maxlen=_TIMING_SAMPLES)
         self._decode_samples: deque[float] = deque(maxlen=_TIMING_SAMPLES)
         self._compute_samples: deque[float] = deque(maxlen=_TIMING_SAMPLES)
         self._counts = {"count": 0, "superseded": 0, "expired": 0}
+        self._last_summary_counts = self._counts.copy()
         self._last_summary = 0.0
         self._metadata: dict[str, Any] = {}
 
@@ -154,7 +154,6 @@ class InferenceServer:
                     self._queryables.append(queryable)
             except Exception:
                 self._stopping.set()
-                self._stop_event.set()
                 with self._condition:
                     self._condition.notify_all()
                 self._close_resources()
@@ -177,7 +176,7 @@ class InferenceServer:
         """Start the server and block until :meth:`stop` is called."""
         self.start()
         try:
-            self._stop_event.wait()
+            self._stopping.wait()
         finally:
             self.stop()
 
@@ -187,7 +186,6 @@ class InferenceServer:
             if self._stopping.is_set():
                 return
             self._stopping.set()
-            self._stop_event.set()
             with self._condition:
                 while self._queue:
                     request = self._queue.popleft()
@@ -213,6 +211,7 @@ class InferenceServer:
         else:
             config = zenoh.Config.from_file(str(self._zenoh_config_path))
         config.insert_json5("transport/link/rx/max_message_size", str(self._max_request_bytes))
+        config.insert_json5("transport/shared_memory/enabled", "false")
         return config
 
     def _build_metadata(self) -> dict[str, Any]:
@@ -234,8 +233,6 @@ class InferenceServer:
             manifest_path = Path(export_dir) / "manifest.json"
             with contextlib.suppress(OSError):
                 manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
-        hardware = getattr(manifest, "hardware", None)
-        cameras = [{"name": camera.name, "shape": list(camera.shape)} for camera in getattr(hardware, "cameras", [])]
         return {
             "protocol_version": PROTOCOL_VERSION,
             "server_id": self._server_id,
@@ -248,7 +245,6 @@ class InferenceServer:
             },
             "chunk_size": chunk_size,
             "rtc": {"supported": has_rtc, "chunk_size": rtc_chunk_size},
-            "cameras": cameras,
             "image_codecs": ["jpeg", "raw"],
             "max_request_bytes": self._max_request_bytes,
         }
@@ -349,14 +345,13 @@ class InferenceServer:
             if self._stopping.is_set():
                 self._reply_error(request.query, request.seq, "shutting_down")
                 return
-            if request.command == "predict":
-                for pending in tuple(self._queue):
-                    if pending.command != "predict":
-                        continue
-                    self._queue.remove(pending)
-                    self._reply_error(pending.query, pending.seq, "superseded")
-                    self._counts["superseded"] += 1
-                    break
+            for pending in tuple(self._queue):
+                if pending.command != request.command:
+                    continue
+                self._queue.remove(pending)
+                self._reply_error(pending.query, pending.seq, "superseded")
+                self._counts["superseded"] += 1
+                break
             self._queue.append(request)
             self._condition.notify()
 
@@ -452,6 +447,9 @@ class InferenceServer:
 
     def _log_summary(self) -> None:
         self._last_summary = time.monotonic()
+        if self._counts == self._last_summary_counts:
+            return
+        self._last_summary_counts = self._counts.copy()
         queue = np.asarray(self._queue_samples, dtype=np.float64)
         decode = np.asarray(self._decode_samples, dtype=np.float64)
         compute = np.asarray(self._compute_samples, dtype=np.float64)

@@ -75,8 +75,6 @@ security model explicitly accepts unless a change crosses that boundary or makes
     default exposure, alter peer-identity assumptions, add peer-selected code or path semantics, or weaken
     payload validation. Preserve fixed payload-size limits before deserialization. `physicalai.robot.transport`
     (Zenoh) applies `/action` payloads to physical hardware **without authentication** and assumes a trusted,
-    isolated robot-cell network. `physicalai.inference.remote` is also **unauthenticated** and binds loopback by
-    default; remote access is intended through SSH tunneling or a Tailscale tailnet protected by ACLs. Direct
-    LAN binding must remain on a trusted, isolated network. If a change alters the trust boundary, update the
-    user security model in the same change. Never add peer-selected code or path semantics without a security
-    review. Deserialization of untrusted transport data must comply with rule 6.
+    isolated robot-cell network. Any new network-capable transport must document its trust boundary, must never
+    deserialize payloads with `pickle` (rule 6 — use msgpack/json), and must not silently widen exposure
+    (e.g. adding remote-code or file-path semantics to wire payloads) without a security review.

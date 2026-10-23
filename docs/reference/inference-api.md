@@ -109,3 +109,7 @@ listener logs an unauthenticated-exposure warning. The flag does not change the
 configured host; without `host`, the server still binds `127.0.0.1`. See
 [Run Inference Remotely](../how-to/runtime/run-inference-remotely.md) for server
 lifecycle, CLI, SSH tunneling, and deployment configuration.
+
+`expected_policy` and `expected_manifest_sha256` are client-side consistency
+checks against metadata reported by the server. The manifest hash is not signed
+and does not establish server authenticity or artifact integrity.

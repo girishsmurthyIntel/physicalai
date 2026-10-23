@@ -20,6 +20,7 @@ from physicalai.transport import DEFAULT_MAX_PAYLOAD_BYTES, pack_msgpack, unpack
 PROTOCOL_VERSION = 1
 DEFAULT_IMAGE_JPEG_QUALITY = 90
 DEFAULT_MAX_REQUEST_BYTES = DEFAULT_MAX_PAYLOAD_BYTES
+MAX_REQUEST_BUDGET_MS = 60_000
 MAX_IMAGE_JPEG_QUALITY = 100
 _RGB_CHANNELS = 3
 _RGB_IMAGE_NDIM = 3
@@ -66,7 +67,7 @@ class RemoteTiming:
     decode_s: float
     request_bytes: int
     reply_bytes: int
-    server_decode_s: float = 0.0
+    server_decode_s: float
 
 
 def encode_message(message: dict[str, Any]) -> bytes:
@@ -151,21 +152,11 @@ def _resize_image(image: np.ndarray, max_image_side: int | None) -> np.ndarray:
     return np.stack([cv2.resize(frame, new_size, interpolation=cv2.INTER_AREA) for frame in image])
 
 
-def encode_images(
-    images: dict[str, Any],
-    *,
-    image_codec: ImageCodec,
-    jpeg_quality: int,
-    max_image_side: int | None,
-) -> dict[str, dict[str, Any]]:
-    """Encode each named RGB image at native resolution unless downscaling is requested.
-
-    Returns:
-        Image descriptors containing encoded bytes, shapes, and codec names.
+def validate_image_options(image_codec: ImageCodec, jpeg_quality: int, max_image_side: int | None) -> None:
+    """Validate the shared image encoding settings.
 
     Raises:
-        ValueError: If codec or resizing options are invalid.
-        RemoteInferenceProtocolError: If an image cannot be encoded.
+        ValueError: If the codec, JPEG quality, or resize limit is invalid.
     """
     if image_codec not in {"jpeg", "raw"}:
         msg = "image_codec must be 'jpeg' or 'raw'"
@@ -182,6 +173,24 @@ def encode_images(
     ):
         msg = "max_image_side must be positive"
         raise ValueError(msg)
+
+
+def encode_images(
+    images: dict[str, Any],
+    *,
+    image_codec: ImageCodec,
+    jpeg_quality: int,
+    max_image_side: int | None,
+) -> dict[str, dict[str, Any]]:
+    """Encode each named RGB image at native resolution unless downscaling is requested.
+
+    Returns:
+        Image descriptors containing encoded bytes, shapes, and codec names.
+
+    Raises:
+        RemoteInferenceProtocolError: If an image cannot be encoded.
+    """
+    validate_image_options(image_codec, jpeg_quality, max_image_side)
     encoded: dict[str, dict[str, Any]] = {}
     for name, value in images.items():
         if not isinstance(name, str):
@@ -355,6 +364,9 @@ def encode_predict_request(
     if not isinstance(budget_ms, int) or isinstance(budget_ms, bool) or budget_ms < 1:
         msg = "budget_ms must be a positive integer"
         raise ValueError(msg)
+    if budget_ms > MAX_REQUEST_BUDGET_MS:
+        msg = f"budget_ms must not exceed {MAX_REQUEST_BUDGET_MS}"
+        raise ValueError(msg)
     model_inputs: dict[str, Any] = {}
     image_inputs: dict[str, Any] = {}
     for name, value in inputs.items():
@@ -440,6 +452,9 @@ def decode_predict_request(
     if not isinstance(budget, int) or isinstance(budget, bool) or budget < 1:
         msg = "Invalid prediction budget"
         raise RemoteInferenceProtocolError(msg)
+    if budget > MAX_REQUEST_BUDGET_MS:
+        msg = "Prediction budget exceeds the server maximum"
+        raise RemoteInferenceProtocolError(msg)
     inputs, decoded_bytes = _validate_predict_inputs(message.get("inputs"))
     if decoded_bytes > max_bytes:
         msg = "Decoded input arrays exceed max_request_bytes"
@@ -463,7 +478,7 @@ def encode_predict_reply(
     server_id: str,
     server_queue_s: float,
     server_compute_s: float,
-    server_decode_s: float = 0.0,
+    server_decode_s: float,
 ) -> bytes:
     """Encode the complete model output map and server timing in a v1 reply.
 
@@ -496,12 +511,13 @@ def decode_predict_reply(payload: bytes) -> dict[str, Any]:
         "seq",
         "server_id",
         "outputs",
+        "server_decode_s",
         "server_queue_s",
         "server_compute_s",
     }
     version = message.get("protocol_version")
     if (
-        set(message) - {"server_decode_s"} != required
+        set(message) != required
         or not isinstance(version, int)
         or isinstance(version, bool)
         or version != PROTOCOL_VERSION
@@ -522,7 +538,6 @@ def decode_predict_reply(payload: bytes) -> dict[str, Any]:
     if any(not isinstance(value, np.ndarray) for value in outputs.values()):
         msg = "Prediction outputs must be NumPy arrays"
         raise RemoteInferenceProtocolError(msg)
-    message.setdefault("server_decode_s", 0.0)
     for field in ("server_decode_s", "server_queue_s", "server_compute_s"):
         value = message.get(field)
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
