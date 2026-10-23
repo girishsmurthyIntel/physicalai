@@ -89,11 +89,20 @@ The expected keys and shapes come from the exported package and its preprocessin
 ## Remote Inference
 
 ```python
-from physicalai.inference import RemoteInferenceModel
+from physicalai.inference import InferenceModel, RemoteInferenceModel
 from physicalai.inference.remote import InferenceServer
 
-server = InferenceServer(model, name="cell1-act", host="127.0.0.1")
-client = RemoteInferenceModel(name="cell1-act", host="127.0.0.1")
+model = InferenceModel("./exports/act_policy")
+server = InferenceServer(model, name="cell1-act")
+server.serve_forever()  # Blocks until interrupted, then stops the server.
+```
+
+On the client, connect to the same deployment name:
+
+```python
+from physicalai.inference import RemoteInferenceModel
+
+client = RemoteInferenceModel(name="cell1-act")
 ```
 
 Both constructors accept keyword-only `host` (default `127.0.0.1`) and `port`
