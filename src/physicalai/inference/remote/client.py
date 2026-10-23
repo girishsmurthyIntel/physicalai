@@ -240,7 +240,8 @@ class RemoteInferenceModel(InferenceModel):
             raise RemoteInferenceProtocolError(msg)
         action_count = actions.shape[-_ACTION_TIME_AXIS_NDIM] if actions.ndim >= _ACTION_TIME_AXIS_NDIM else 1
         chunk_size = self.chunk_size
-        if action_count > chunk_size:
+        # InferenceModel uses 1 when an export does not declare its chunk size.
+        if chunk_size > 1 and action_count > chunk_size:
             msg = f"Remote action chunk length {action_count} exceeds advertised chunk_size {chunk_size}"
             raise RemoteInferenceProtocolError(msg)
 

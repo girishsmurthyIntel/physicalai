@@ -179,9 +179,11 @@ The client constructor performs no network I/O, so its configuration can be roun
 During the handshake, the client verifies that its configured `image_codec` is
 advertised by the server while tolerating additional codecs from newer servers.
 It also enforces the server's advertised `max_request_bytes` before sending a
-prediction. Returned `action` arrays must have a floating-point dtype, contain
-only finite values, and not exceed the advertised chunk size. Camera descriptors
-are not part of the handshake metadata.
+prediction. Returned `action` arrays must have a floating-point dtype and contain
+only finite values. The client rejects chunks larger than an advertised size
+greater than one; `1` is also the fallback when the export omits chunk-size
+metadata, so it is not treated as a hard limit. Camera descriptors are not part
+of the handshake metadata.
 
 ## Failure Behavior
 

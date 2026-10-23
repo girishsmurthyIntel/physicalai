@@ -1479,6 +1479,27 @@ def test_client_rejects_invalid_action_outputs_from_server(actions: np.ndarray, 
         server.stop()
 
 
+def test_client_accepts_chunk_when_server_metadata_uses_unknown_size_fallback() -> None:
+    class _UnknownChunkModel(_Model):
+        def __init__(self, policy_name: str) -> None:
+            super().__init__(policy_name)
+            self.chunk_size = 1
+
+        def __call__(self, inputs: dict[str, Any]) -> dict[str, np.ndarray]:
+            return {ACTION: np.ones((1, 50, 3), dtype=np.float32)}
+
+    name = "unknown-chunk-size"
+    server = InferenceServer(_UnknownChunkModel(name), name, port=_free_port())
+    server.start()
+    client = RemoteInferenceModel(name, port=server.port)
+    try:
+        assert client.chunk_size == 1
+        assert client.predict_action_chunk({"state": np.zeros(3, dtype=np.float32)}).shape == (50, 3)
+    finally:
+        client.close()
+        server.stop()
+
+
 def test_client_rejects_action_batch_larger_than_one() -> None:
     class _BatchedModel(_Model):
         def __call__(self, inputs: dict[str, Any]) -> dict[str, np.ndarray]:
